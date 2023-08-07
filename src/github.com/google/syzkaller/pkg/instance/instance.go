@@ -343,7 +343,7 @@ func (inst *inst) testInstance() error {
 	}
 
 	cmd := OldFuzzerCmd(fuzzerBin, executorBin, targets.TestOS, inst.cfg.TargetOS, inst.cfg.TargetArch, fwdAddr,
-		inst.cfg.Sandbox, 0, inst.cfg.Cover, true, inst.optionalFlags, inst.cfg.Timeouts.Slowdown)
+		inst.cfg.Sandbox, 0, inst.cfg.Cover, inst.cfg.Event, inst.cfg.Vanilla, true, inst.optionalFlags, inst.cfg.Timeouts.Slowdown)
 	outc, errc, err := inst.vm.Run(10*time.Minute*inst.cfg.Timeouts.Scale, nil, cmd)
 	if err != nil {
 		return fmt.Errorf("failed to run binary in VM: %v", err)
@@ -427,6 +427,8 @@ type FuzzerCmdArgs struct {
 	Procs     int
 	Verbosity int
 	Cover     bool
+	Event     bool
+	Vanilla   bool
 	Debug     bool
 	Test      bool
 	Runtest   bool
@@ -458,21 +460,21 @@ func FuzzerCmd(args *FuzzerCmdArgs) string {
 		optionalArg = " " + tool.OptionalFlags(flags)
 	}
 	return fmt.Sprintf("%v -executor=%v -name=%v -arch=%v%v -manager=%v -sandbox=%v"+
-		" -procs=%v -cover=%v -debug=%v -test=%v%v%v%v",
+		" -procs=%v -cover=%v -event=%v -vanilla=%v -debug=%v -test=%v%v%v%v",
 		args.Fuzzer, args.Executor, args.Name, args.Arch, osArg, args.FwdAddr, args.Sandbox,
-		args.Procs, args.Cover, args.Debug, args.Test, runtestArg, verbosityArg, optionalArg)
+		args.Procs, args.Cover, args.Event, args.Vanilla, args.Debug, args.Test, runtestArg, verbosityArg, optionalArg)
 }
 
 func OldFuzzerCmd(fuzzer, executor, name, OS, arch, fwdAddr, sandbox string, procs int,
-	cover, test, optionalFlags bool, slowdown int) string {
+	cover, event, vanilla, test, optionalFlags bool, slowdown int) string {
 	var optional *OptionalFuzzerArgs
 	if optionalFlags {
 		optional = &OptionalFuzzerArgs{Slowdown: slowdown}
 	}
 	return FuzzerCmd(&FuzzerCmdArgs{Fuzzer: fuzzer, Executor: executor, Name: name,
 		OS: OS, Arch: arch, FwdAddr: fwdAddr, Sandbox: sandbox, Procs: procs,
-		Verbosity: 0, Cover: cover, Debug: false, Test: test, Runtest: false,
-		Optional: optional})
+		Verbosity: 0, Cover: cover, Event: event, Vanilla: vanilla, Debug: false, Test: test,
+		Runtest: false, Optional: optional})
 }
 
 func ExecprogCmd(execprog, executor, OS, arch, sandbox string, repeat, threaded, collide bool,

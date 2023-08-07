@@ -24,7 +24,7 @@ func TestIsComplexPtr(t *testing.T) {
 			continue
 		}
 		for i := 0; i < iters; i++ {
-			s := newState(target, ct, nil)
+			s := newState(target, ct, nil, nil)
 			calls := r.generateParticularCall(s, meta)
 			p := &Prog{Target: target, Calls: calls}
 			for _, arg := range p.complexPtrs() {

@@ -389,7 +389,7 @@ func (r *randGen) createResource(s *state, res *ResourceType, dir Dir) (Arg, []*
 	// Generate one of them.
 	meta := metas[r.Intn(len(metas))]
 	calls := r.generateParticularCall(s, meta)
-	s1 := newState(r.target, s.ct, nil)
+	s1 := newState(r.target, s.ct, nil, s.evState)
 	s1.analyze(calls[len(calls)-1])
 	// Now see if we have what we want.
 	var allres []*ResultArg
@@ -534,6 +534,37 @@ func (r *randGen) nOutOf(n, outOf int) bool {
 	return v < n
 }
 
+func (r *randGen) generateCalls(s *state, p *Prog, insertionPoint int, inGeneration int) ([]*Call, bool) {
+	if s.evState.GetLength() < 50 || r.Intn(2) == 0 {
+		return r.generateCall(s, p, insertionPoint), false
+	} else {
+		return r.generateCallsEv(s, p, insertionPoint, inGeneration), true
+	}
+}
+
+func (r *randGen) generateCallsEv(s *state, p *Prog, insertionPoint int, inGeneration int) []*Call {
+	var biasCall *Call = nil
+	var biasID int = -1
+	if insertionPoint > 0 {
+		biasCall = p.Calls[r.Intn(insertionPoint)]
+		biasID = biasCall.Meta.ID
+	}
+	names, args := s.evState.chooseGroup(r.Rand, biasID, inGeneration)
+	if names == nil || len(names) == 0 {
+		return r.generateCall(s, p, insertionPoint)
+	}
+	meta := r.target.SyscallMap[names[0]]
+	calls := r.generateParticularCallEv(s, meta, args[0], biasCall)
+	if biasCall == nil {
+		biasCall = calls[len(calls)-1]
+	}
+	for i := 1; i < len(names); i++ {
+		meta = r.target.SyscallMap[names[i]]
+		calls = append(calls, r.generateParticularCallEv(s, meta, args[i], biasCall)...)
+	}
+	return calls
+}
+
 func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	biasCall := -1
 	if insertionPoint > 0 {
@@ -543,6 +574,22 @@ func (r *randGen) generateCall(s *state, p *Prog, insertionPoint int) []*Call {
 	idx := s.ct.choose(r.Rand, biasCall)
 	meta := r.target.Syscalls[idx]
 	return r.generateParticularCall(s, meta)
+}
+
+func (r *randGen) generateParticularCallEv(s *state, meta *Syscall, args []Arg, biasCall *Call) (calls  []*Call) {
+	if meta.Attrs.Disabled {
+		panic(fmt.Sprintf("generating disabled call %v", meta.Name))
+	}
+	if len(meta.Args) != len(args) {
+		panic(fmt.Sprintf("length of syscall fields and length of previous args don't match"))
+	}
+	c := &Call{
+		Meta: meta,
+		Ret:  MakeReturnArg(meta.Ret),
+	}
+	c.Args, calls = r.generateArgsEv(s, meta.Args, args, biasCall, DirIn)
+	r.target.assignSizesCall(c)
+	return append(calls, c)
 }
 
 func (r *randGen) generateParticularCall(s *state, meta *Syscall) (calls []*Call) {
@@ -561,7 +608,7 @@ func (target *Target) GenerateAllSyzProg(rs rand.Source) *Prog {
 		Target: target,
 	}
 	r := newRand(target, rs)
-	s := newState(target, target.DefaultChoiceTable(), nil)
+	s := newState(target, target.DefaultChoiceTable(), nil, nil)
 	handled := make(map[string]bool)
 	for _, meta := range target.Syscalls {
 		if !strings.HasPrefix(meta.CallName, "syz_") || handled[meta.CallName] || meta.Attrs.Disabled {
@@ -589,6 +636,22 @@ func (target *Target) DataMmapProg() *Prog {
 	}
 }
 
+func (r *randGen) generateArgsEv(s *state, fields []Field, args []Arg, biasCall *Call, dir Dir) ([]Arg, []*Call) {
+	var calls []*Call
+	new_args := make([]Arg, len(fields))
+
+	for i, field := range fields {
+		arg, calls1 := r.generateArgEv(s, field.Type, args[i], biasCall, field.Dir(dir))
+		if arg == nil {
+			panic(fmt.Sprintf("generated arg is nil for field '%v', fields: %+v", field.Type.Name(), fields))
+		}
+		new_args[i] = arg
+		calls = append(calls, calls1...)
+	}
+
+	return new_args, calls
+}
+
 func (r *randGen) generateArgs(s *state, fields []Field, dir Dir) ([]Arg, []*Call) {
 	var calls []*Call
 	args := make([]Arg, len(fields))
@@ -604,6 +667,224 @@ func (r *randGen) generateArgs(s *state, fields []Field, dir Dir) ([]Arg, []*Cal
 	}
 
 	return args, calls
+}
+
+func (r *randGen) generateArgEv(s *state, typ Type, prev_arg Arg, biasCall *Call, dir Dir) (Arg, []*Call) {
+	if prev_arg == nil {
+		// since we cannot reuse a recorded argument we have to go back to the conventional way
+		r.generateArg(s, typ, dir)
+	}
+	switch typ.(type) {
+	case *IntType, *ConstType, *FlagsType, *LenType, *ProcType, *CsumType:
+		// No special resources needed, we can just use the old stuff
+		constArg, ok := prev_arg.(*ConstArg)
+		if !ok {
+			return r.generateArg(s, typ, dir)
+		}
+		return MakeConstArg(typ, dir, constArg.Val), nil
+	case *VmaType:
+		ptrArg, ok := prev_arg.(*PointerArg)
+		if !ok {
+			fmt.Println(prev_arg)
+			panic("type of prev_arg is wrong")
+		}
+		return MakeVmaPointerArg(typ, dir, ptrArg.Address, ptrArg.VmaSize), nil
+	case *BufferType, *StructType, *UnionType, *PtrType, *ArrayType, *ResourceType:
+		return typ.generateEv(r, s, prev_arg, biasCall, dir)
+	}
+	return nil, nil
+}
+
+func (a *BufferType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	if prev_arg == nil || a.TypeSize != prev_arg.Size() {
+		return a.generate(r, s, dir)
+	} else {
+		prevDataArg, ok := prev_arg.(*DataArg)
+		if !ok {
+			return a.generate(r, s, dir)
+		}
+		if dir == DirOut {
+			return MakeOutDataArg(a, dir, prevDataArg.size), nil
+		} else {
+			return MakeDataArg(a, dir, prevDataArg.data), nil
+		}
+	}
+}
+
+func (a *StructType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	if prev_arg == nil {
+		return a.generate(r, s, dir)
+	}
+	// prev_arg should be GroupArg
+	var groupArg *GroupArg
+	switch prev_arg.(type) {
+	case *GroupArg:
+		groupArg = prev_arg.(*GroupArg)
+	default:
+		return a.generate(r, s, dir)
+	}
+	var inner []Arg
+	for i := 0; i < len(a.Fields); i++ {
+		var arg1 Arg
+		var calls1 []*Call
+		if len(groupArg.Inner) <= i {
+			arg1, calls1 = r.generateArg(s, a.Fields[i].Type, dir)
+		} else {
+			arg1, calls1 = r.generateArgEv(s, a.Fields[i].Type, groupArg.Inner[i], biasCall, a.Fields[i].Dir(dir))
+		}
+		if arg1 == nil {
+			panic("arg1 is nil! this should not be")
+		}
+		inner = append(inner, arg1)
+		calls = append(calls, calls1...)
+	}
+	return MakeGroupArg(a, dir, inner), calls
+}
+
+func (a *ArrayType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	if prev_arg == nil {
+		return a.generate(r, s, dir)
+	}
+	var groupArg *GroupArg
+	switch prev_arg.(type) {
+	case *GroupArg:
+		groupArg = prev_arg.(*GroupArg)
+	default:
+		return a.generate(r, s, dir)
+	}
+
+	count := len(groupArg.Inner)
+	var inner []Arg
+	for i := 0; i < count; i++ {
+		arg1, calls1 := r.generateArgEv(s, a.Elem, groupArg.Inner[i], biasCall, dir)
+		if arg1 == nil {
+			panic("arg1 is nil! this should not be!")
+		}
+		inner = append(inner, arg1)
+		calls = append(calls, calls1...)
+	}
+	return MakeGroupArg(a, dir, inner), calls
+}
+
+func (a *UnionType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	if prev_arg == nil {
+		return a.generate(r, s, dir)
+	}
+	var unionArg *UnionArg
+	switch prev_arg.(type) {
+	case *UnionArg:
+		unionArg = prev_arg.(*UnionArg)
+	default:
+		return a.generate(r, s, dir)
+	}
+	if unionArg.Index >= len(a.Fields) {
+		return a.generate(r, s, dir)
+	}
+	optType, optDir := a.Fields[unionArg.Index].Type, a.Fields[unionArg.Index].Dir(dir)
+	opt, calls := r.generateArgEv(s, optType, unionArg.Option, biasCall, optDir)
+	return MakeUnionArg(a, dir, opt, unionArg.Index), calls
+}
+
+func (a *PtrType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	if prev_arg == nil {
+		return a.generate(r, s, dir)
+	}
+	var ptrArg *PointerArg
+	switch prev_arg.(type) {
+	case *PointerArg:
+		ptrArg = prev_arg.(*PointerArg)
+	default:
+		return a.generate(r, s, dir)
+	}
+
+	if ptrArg.Res == nil {
+		return a.generate(r, s, dir)
+	}
+
+	inner, calls := r.generateArgEv(s, a.Elem, ptrArg.Res, biasCall, a.ElemDir)
+	if inner == nil {
+		panic("inner is nil")
+	}
+	arg = r.allocAddr(s, a, dir, inner.Size(), inner)
+	return arg, calls
+}
+
+func (a *ResourceType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	// first crawl biasCall for suitable resources
+	// if we cannot find anything there, create them using the generateMethod for ResourceType
+	if biasCall == nil {
+		return a.generate(r, s, dir)
+	}
+	stack := make([]Arg, len(biasCall.Args))
+	for i, arg1 := range biasCall.Args {
+		if arg1 != nil {
+			stack[i] = arg1
+		}
+	}
+	for ; len(stack) > 0; {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		switch cur.Type().(type) {
+		case *StructType:
+			c := cur.(*GroupArg)
+			for _, field := range c.Inner {
+				if field == nil {
+					continue
+				}
+				stack = append(stack, field)
+			}
+		case *ArrayType:
+			c := cur.(*GroupArg)
+			if len(c.Inner) == 0 {
+				continue
+			}
+			if c.Inner[0] == nil {
+				continue
+			}
+			stack = append(stack, c.Inner[0])
+		case *PtrType:
+			if cur.(*PointerArg).Res == nil {
+				continue
+			}
+			stack = append(stack, cur.(*PointerArg).Res)
+		case *ResourceType:
+			dstRes := s.target.resourceMap[a.Desc.Name]
+			srcRes := s.target.resourceMap[cur.Type().Name()]
+			if dstRes == nil || srcRes == nil {
+				panic("unknown resource")
+			}
+			if isCompatibleResourceImpl(dstRes.Kind, srcRes.Kind, true) {
+				if a.TypeSize == cur.Type().Size() {
+					return MakeResultArg(a, dir, cur.(*ResultArg), 0), nil
+				}
+			}
+		}
+	}
+	// no suitable resource found, let's ask the existing algorithm for help
+	return a.generate(r, s, dir)
+}
+
+// never used but compiler needs it
+func (a *IntType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *FlagsType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *LenType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *CsumType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *ConstType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *ProcType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
+}
+func (a *VmaType) generateEv(r *randGen, s *state, prev_arg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call) {
+	return prev_arg, nil
 }
 
 func (r *randGen) generateArg(s *state, typ Type, dir Dir) (arg Arg, calls []*Call) {
@@ -910,7 +1191,7 @@ func getCompatibleResources(p *Prog, resourceType string, r *randGen) (resources
 		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
 			// Collect only initialized resources (the ones that are already used in other calls).
 			a, ok := arg.(*ResultArg)
-			if !ok || len(a.uses) == 0 || a.Dir() != DirOut {
+			if !ok || len(a.uses) == 0 || a.GetDir() != DirOut {
 				return
 			}
 			if !r.target.isCompatibleResource(resourceType, a.Type().Name()) {

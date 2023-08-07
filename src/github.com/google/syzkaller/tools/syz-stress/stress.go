@@ -102,15 +102,15 @@ func main() {
 			for i := 0; ; i++ {
 				var p *prog.Prog
 				if *flagGenerate && len(corpus) == 0 || i%4 != 0 {
-					p = target.Generate(rs, prog.RecommendedCalls, ct)
+					p = target.Generate(rs, prog.RecommendedCalls, ct, prog.InitEvTrackState())
 					execute(pid, env, execOpts, p)
-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
+					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, prog.InitEvTrackState())
 					execute(pid, env, execOpts, p)
 				} else {
 					p = corpus[rnd.Intn(len(corpus))].Clone()
-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
+					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, prog.InitEvTrackState())
 					execute(pid, env, execOpts, p)
-					p.Mutate(rs, prog.RecommendedCalls, ct, corpus)
+					p.Mutate(rs, prog.RecommendedCalls, ct, corpus, prog.InitEvTrackState())
 					execute(pid, env, execOpts, p)
 				}
 			}

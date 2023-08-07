@@ -43,6 +43,7 @@ const (
 	FlagEnableVhciInjection                      // setup and use /dev/vhci for hci packet injection
 	FlagEnableWifi                               // setup and use mac80211_hwsim for wifi emulation
 	FlagDelayKcovMmap                            // manage kcov memory in an optimized way
+	FlagEvent                                    // collect event coverage
 )
 
 // Per-exec flags for ExecOpts.Flags.
@@ -89,6 +90,7 @@ type CallInfo struct {
 	Signal []uint32 // feedback signal, filled if FlagSignal is set
 	Cover  []uint32 // per-call coverage, filled if FlagSignal is set and cover == true,
 	// if dedup == false, then cov effectively contains a trace, otherwise duplicates are removed
+	EvList []prog.EvtrackEvent // events triggered by this call
 	Comps prog.CompMap // per-call comparison operands
 	Errno int          // call errno (0 if the call was successful)
 }
@@ -115,7 +117,7 @@ type Env struct {
 }
 
 const (
-	outputSize = 16 << 20
+	outputSize = 20 << 20
 
 	statusFail = 67
 
@@ -339,7 +341,7 @@ func (env *Env) parseOutput(p *prog.Prog, opts *ExecOpts) (*ProgInfo, error) {
 		out = out[unsafe.Sizeof(callReply{}):]
 		var inf *CallInfo
 		if reply.magic != outMagic {
-			return nil, fmt.Errorf("bad reply magic 0x%x", reply.magic)
+			return nil, fmt.Errorf("bad reply magic 0x%x for call %v", reply.magic, i)
 		}
 		if reply.index != extraReplyIndex {
 			if int(reply.index) >= len(info.Calls) {
@@ -371,6 +373,12 @@ func (env *Env) parseOutput(p *prog.Prog, opts *ExecOpts) (*ProgInfo, error) {
 			return nil, err
 		}
 		inf.Comps = comps
+
+		evList, err := readEvents(&out, reply.eventSize)
+		if err != nil {
+			return nil, err
+		}
+		inf.EvList = evList
 	}
 	if len(extraParts) == 0 {
 		return info, nil
@@ -446,6 +454,126 @@ func readComps(outp *[]byte, compsSize uint32) (prog.CompMap, error) {
 		compMap.AddComp(op1, op2)
 	}
 	return compMap, nil
+}
+
+func readEvents(outp *[]byte, eventSize uint32) ([]prog.EvtrackEvent, error) {
+	var ok bool
+	var evList = make([]prog.EvtrackEvent, eventSize)
+	for i := uint32(0); i < eventSize; i++ {
+		evList[i].EventId, ok = readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read event_id %v", i)
+		}
+		eventType, ok := readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read type %v", i)
+		}
+		evList[i].EventType = prog.EvtrackEventType(eventType)
+		evList[i].Ptr, ok = readUint64(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read ptr %v", i)
+		}
+		size, ok := readUint64(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read size %v", i)
+		}
+		evList[i].Size = prog.Size_t(size)
+		evList[i].NumTrace, ok = readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read num trace %v", i)
+		}
+		evList[i].TimeStamp, ok = readUint64(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read timestamp %v", i)
+		}
+		evList[i].ObjId, ok = readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read obj_id %v", i)
+		}
+		evList[i].InstrId, ok = readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read instr_id %v", i)
+		}
+		if evList[i].EventId != (i + 1) || evList[i].NumTrace > prog.NR_MAX_TRACE_ENTRIES ||
+		evList[i].EventType > prog.EVTRACK_EVENT_TYPES {
+			var all_zero bool = true
+			all_zero = all_zero && (evList[i].EventId == 0)
+			all_zero = all_zero && (evList[i].EventType == 0)
+			all_zero = all_zero && (evList[i].Ptr == 0)
+			all_zero = all_zero && (evList[i].NumTrace == 0)
+			all_zero = all_zero && (evList[i].Size == 0)
+			all_zero = all_zero && (evList[i].TimeStamp == 0)
+			all_zero = all_zero && (evList[i].ObjId == 0)
+			all_zero = all_zero && (evList[i].InstrId == 0)
+			if all_zero {
+				var end uint32 = 0
+				ind := 0
+				for end != 0xdeadbeef {
+					end, ok = readUint32(outp)
+					if !ok {
+						return nil, fmt.Errorf("failed to find end token")
+					}
+					ind++
+					if ind > 32 {
+						break
+					}
+				}
+				continue
+			} else {
+				evList[i].EventId = 0
+				evList[i].EventType = 0
+				evList[i].Ptr = 0
+				evList[i].NumTrace = 0
+				evList[i].Size = 0
+				evList[i].TimeStamp = 0
+				evList[i].ObjId = 0
+				evList[i].InstrId = 0
+				var end uint32 = 0
+				for end != 0xdeadbeef {
+					end, ok = readUint32(outp)
+					if !ok {
+						return nil, fmt.Errorf("failed to find end token")
+					}
+				}
+				continue
+			}
+		}
+		evList[i].Trace = make([]uint32, evList[i].NumTrace)
+		for j := uint32(0); j < evList[i].NumTrace; j++ {
+			evList[i].Trace[j], ok = readUint32(outp)
+			if !ok {
+				return nil, fmt.Errorf("failed to read trace %v", i)
+			}
+		}
+
+		if evList[i].NumTrace == 3 {
+			// this seems to be an event with broken stacktrace
+			evList[i].EventId = 0
+			evList[i].EventType = 0
+			evList[i].Ptr = 0
+			evList[i].NumTrace = 0
+			evList[i].Size = 0
+			evList[i].TimeStamp = 0
+			evList[i].ObjId = 0
+			evList[i].InstrId = 0
+			evList[i].Trace[0] = 0
+			evList[i].Trace[1] = 0
+			evList[i].Trace[2] = 0
+		}
+		end, ok := readUint32(outp)
+		if !ok {
+			return nil, fmt.Errorf("failed to read end token")
+		}
+		if end != 0xdeadbeef {
+			for end != 0xdeadbeef {
+				end, ok = readUint32(outp)
+				if !ok {
+					return nil, fmt.Errorf("failed to read end token")
+				}
+			}
+		}
+	}
+	return evList, nil
 }
 
 func readUint32(outp *[]byte) (uint32, bool) {
@@ -543,6 +671,7 @@ type callReply struct {
 	signalSize uint32
 	coverSize  uint32
 	compsSize  uint32
+	eventSize  uint32
 	// signal/cover/comps follow
 }
 
@@ -796,7 +925,7 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged b
 		if _, err := io.ReadFull(c.inrp, callReplyData); err != nil {
 			break
 		}
-		if callReply.signalSize != 0 || callReply.coverSize != 0 || callReply.compsSize != 0 {
+		if callReply.signalSize != 0 || callReply.coverSize != 0 || callReply.compsSize != 0 || callReply.eventSize != 0 {
 			// This is unsupported yet.
 			fmt.Fprintf(os.Stderr, "executor %v: got call reply with coverage\n", c.pid)
 			os.Exit(1)

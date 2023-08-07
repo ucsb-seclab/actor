@@ -16,6 +16,7 @@ type state struct {
 	target    *Target
 	ct        *ChoiceTable
 	corpus    []*Prog
+	evState   *EvTrackState
 	files     map[string]bool
 	resources map[string][]*ResultArg
 	strings   map[string]bool
@@ -24,8 +25,8 @@ type state struct {
 }
 
 // analyze analyzes the program p up to but not including call c.
-func analyze(ct *ChoiceTable, corpus []*Prog, p *Prog, c *Call) *state {
-	s := newState(p.Target, ct, corpus)
+func analyze(ct *ChoiceTable, corpus []*Prog, p *Prog, c *Call, evState *EvTrackState) *state {
+	s := newState(p.Target, ct, corpus, evState)
 	resources := true
 	for _, c1 := range p.Calls {
 		if c1 == c {
@@ -36,11 +37,12 @@ func analyze(ct *ChoiceTable, corpus []*Prog, p *Prog, c *Call) *state {
 	return s
 }
 
-func newState(target *Target, ct *ChoiceTable, corpus []*Prog) *state {
+func newState(target *Target, ct *ChoiceTable, corpus []*Prog, evState *EvTrackState) *state {
 	s := &state{
 		target:    target,
 		ct:        ct,
 		corpus:    corpus,
+		evState:   evState,
 		files:     make(map[string]bool),
 		resources: make(map[string][]*ResultArg),
 		strings:   make(map[string]bool),
@@ -69,13 +71,13 @@ func (s *state) analyzeImpl(c *Call, resources bool) {
 		switch typ := arg.Type().(type) {
 		case *ResourceType:
 			a := arg.(*ResultArg)
-			if resources && a.Dir() != DirIn {
+			if resources && a.GetDir() != DirIn {
 				s.resources[typ.Desc.Name] = append(s.resources[typ.Desc.Name], a)
 				// TODO: negative PIDs and add them as well (that's process groups).
 			}
 		case *BufferType:
 			a := arg.(*DataArg)
-			if a.Dir() != DirOut && len(a.Data()) != 0 {
+			if a.GetDir() != DirOut && len(a.Data()) != 0 {
 				val := string(a.Data())
 				// Remove trailing zero padding.
 				for len(val) >= 2 && val[len(val)-1] == 0 && val[len(val)-2] == 0 {

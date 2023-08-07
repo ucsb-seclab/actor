@@ -9,14 +9,14 @@ import (
 
 // Generate generates a random program with ncalls calls.
 // ct contains a set of allowed syscalls, if nil all syscalls are used.
-func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Prog {
+func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable, evState *EvTrackState) *Prog {
 	p := &Prog{
 		Target: target,
 	}
 	r := newRand(target, rs)
-	s := newState(target, ct, nil)
+	s := newState(target, ct, nil, evState)
 	for len(p.Calls) < ncalls {
-		calls := r.generateCall(s, p, len(p.Calls))
+		calls, _ := r.generateCalls(s, p, len(p.Calls), -1)
 		for _, c := range calls {
 			s.analyze(c)
 			p.Calls = append(p.Calls, c)

@@ -142,7 +142,7 @@ func (a *PointerArg) serialize(ctx *serializer) {
 
 func (a *DataArg) serialize(ctx *serializer) {
 	typ := a.Type().(*BufferType)
-	if a.Dir() == DirOut {
+	if a.GetDir() == DirOut {
 		ctx.printf("\"\"/%v", a.Size())
 		return
 	}
@@ -1078,7 +1078,7 @@ func (p *parser) auto(arg Arg) Arg {
 }
 
 func (p *parser) fixupAutos(prog *Prog) {
-	s := analyze(nil, nil, prog, nil)
+	s := analyze(nil, nil, prog, nil, nil)
 	for _, c := range prog.Calls {
 		p.target.assignSizesArray(c.Args, c.Meta.Args, p.autos)
 		ForeachArg(c, func(arg Arg, _ *ArgCtx) {

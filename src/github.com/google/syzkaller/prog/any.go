@@ -73,7 +73,7 @@ func (p *Prog) complexPtrs() (res []*PointerArg) {
 }
 
 func (target *Target) isComplexPtr(arg *PointerArg) bool {
-	if arg.Res == nil || arg.Dir() != DirIn {
+	if arg.Res == nil || arg.GetDir() != DirIn {
 		return false
 	}
 	if target.isAnyPtr(arg.Type()) {
@@ -145,7 +145,7 @@ func (target *Target) squashPtr(arg *PointerArg) {
 	var elems []Arg
 	target.squashPtrImpl(arg.Res, &elems)
 	newType := target.getAnyPtrType(arg.Type().Size())
-	arg.ref = newType.ref()
+	arg.Ref = newType.ref()
 	arg.Res = MakeGroupArg(newType.Elem, DirIn, elems)
 	if size := arg.Res.Size(); size != size0 {
 		panic(fmt.Sprintf("squash changed size %v->%v for %v", size0, size, res0.Type()))
@@ -168,7 +168,7 @@ func (target *Target) squashPtrImpl(a Arg, elems *[]Arg) {
 		}
 		target.squashPtrImpl(arg.Option, elems)
 	case *DataArg:
-		if arg.Dir() == DirOut {
+		if arg.GetDir() == DirOut {
 			pad = arg.Size()
 		} else {
 			elem := target.ensureDataElem(elems)
@@ -239,8 +239,8 @@ func (target *Target) squashResult(arg *ResultArg, elems *[]Arg) {
 	default:
 		panic("bad")
 	}
-	arg.ref = typ.ref()
-	arg.dir = DirIn
+	arg.Ref = typ.ref()
+	arg.Dir = DirIn
 	*elems = append(*elems, MakeUnionArg(target.any.union, DirIn, arg, index))
 }
 

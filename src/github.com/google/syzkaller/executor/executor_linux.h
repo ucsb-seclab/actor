@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+// kcov
 const unsigned long KCOV_TRACE_PC = 0;
 const unsigned long KCOV_TRACE_CMP = 1;
 
@@ -44,6 +45,60 @@ static inline __u64 kcov_remote_handle(__u64 subsys, __u64 inst)
 		return 0;
 	return subsys | inst;
 }
+
+// evtrack
+#define EVTRACK_INIT_TRACK32  _IOR('c', 1, uint32)
+#define EVTRACK_INIT_TRACK64  _IOR('c', 1, uint64)
+#define EVTRACK_ENABLE        _IO('c', 100)
+#define EVTRACK_DISABLE       _IO('c', 101)
+#define EVTRACK_STOP          _IO('c', 103)
+#define NR_EVENTS              1024
+#define EVTRACK_TRACK_ALL      0
+
+/* Maximum number of stack trace entries in the context stored */
+#define NR_MAX_TRACE_ENTRIES     32
+
+/* Test syscall number added for debugging purpose */
+#define SYS_MYCALL               548
+
+typedef unsigned long u64;
+
+/* Ideally, <uapi/linux/evtrack.h> should be present on the system */
+enum evtrack_event_types {
+	/* Heap allocations, e.g. kmalloc() */
+	EVTRACK_EVENT_HEAP_ALLOCATION = 1,
+
+	/* Heap deallocations, e.g. kfree() */
+	EVTRACK_EVENT_HEAP_DEALLOCATION = 2,
+
+	/* Reading from heap buffer */
+	EVTRACK_EVENT_HEAP_READ = 3,
+
+	/* Writing to heap buffer */
+	EVTRACK_EVENT_HEAP_WRITE = 4
+
+};
+
+struct evtrack_event {
+	unsigned int event_id;              // Monotonically increasing event id
+	enum evtrack_event_types type;      // Type of the event
+	uint64 ptr;                         // Pointer associated to the event
+	size_t size;                        // Size associated to the event
+	unsigned int nr_trace;              // Number of entries in the stack trace
+	/*
+	 * Ref: http://static.lwn.net/images/pdf/LDD3/ch11.pdf
+	 * If a user-space program needs to use these types, it can prefix the names
+	 * with a double underscore: __u8 and the other types are defined independent
+	 * of __KERNEL__. If, for example, a driver needs to exchange binary structures
+	 * with a program running in user space by means of ioctl, the header files
+	 * should declare 32-bit fields in the structures as __u32.
+	 */
+	uint64 timestamp;                   // Nano-seconds
+	unsigned int obj_id;                // The event_id of the object this event is related to
+	unsigned long instr_id;             // The id of the instruction that triggers this event
+	uint64 trace[NR_MAX_TRACE_ENTRIES]; // Stack-trace leading to the event
+};
+
 
 static bool detect_kernel_bitness();
 static bool detect_gvisor();
@@ -173,6 +228,67 @@ static bool use_cover_edges(uint64 pc)
 #endif
 	return true;
 }
+
+static void evtrack_open(evtrack_t* ev)
+{
+	int fd = open("/sys/kernel/debug/evtrack", O_RDWR);
+	if (fd == -1)
+		fail("open of /sys/kernel/debug/evtrack failed");
+	if (dup2(fd, ev->fd) < 0)
+		failmsg("evtrack_open cannat dup", "failed to dup2(%d, %d) evtrack fd", fd, ev->fd);
+	close(fd);
+	const int EVTRACK_INIT_TRACK = is_kernel_64_bit ? EVTRACK_INIT_TRACK64 : EVTRACK_INIT_TRACK32;
+	if (ioctl(ev->fd, EVTRACK_INIT_TRACK, NR_EVENTS))
+		fail("evtrack init trace write failed");
+	size_t mmap_alloc_size = NR_EVENTS * sizeof(struct evtrack_event);
+	ev->events = (struct evtrack_event*)mmap(NULL, mmap_alloc_size,
+			PROT_READ | PROT_WRITE, MAP_SHARED, ev->fd, 0);
+	if (ev->events == MAP_FAILED)
+		fail("evtrack mmap failed");
+}
+
+static void evtrack_enable(evtrack_t* ev)
+{
+	if (ioctl(ev->fd, EVTRACK_ENABLE, EVTRACK_TRACK_ALL))
+		exitf("evtrack enable failed");
+	else
+		debug("event enabled pid=%d\n", getpid());
+	return;
+}
+
+static void evtrack_collect(evtrack_t* ev)
+{
+	// Note: this assumes little-endian kernel.
+	ev->size = ev->events->size;
+}
+
+static void evtrack_reset(evtrack_t* ev)
+{
+	// Callers in common_linux.h don't check this flag.
+	if (!flag_collect_event)
+		return;
+	ev->events->size = 0;
+}
+
+static void evtrack_stop(evtrack_t* ev)
+{
+	if (ioctl(ev->fd, EVTRACK_STOP, 0))
+		exitf("evtrack stop failed");
+	else
+		debug("event stop pid=%d\n", getpid());
+	return;
+}
+
+static void evtrack_disable(evtrack_t* ev)
+{
+	if (ioctl(ev->fd, EVTRACK_DISABLE, 0))
+		exitf("evtrack disable failed");
+	else
+		debug("event disabled pid=%d\n", getpid());
+	return;
+}
+
+
 
 static bool detect_kernel_bitness()
 {

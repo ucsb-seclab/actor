@@ -9,6 +9,10 @@ import (
 	"net"
 	"sync"
 	"time"
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
+	"io"
 
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/host"
@@ -16,12 +20,15 @@ import (
 	"github.com/google/syzkaller/pkg/mgrconfig"
 	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
+	"github.com/google/syzkaller/pkg/evtrack"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/pkg/ivshmem"
 )
 
 type RPCServer struct {
 	mgr                   RPCManagerView
 	cfg                   *mgrconfig.Config
+	unpackedCfg           map[string]string
 	modules               []host.KernelModule
 	port                  int
 	targetEnabledSyscalls map[*prog.Syscall]bool
@@ -38,6 +45,34 @@ type RPCServer struct {
 	rotator       *prog.Rotator
 	rnd           *rand.Rand
 	checkFailures int
+	vanilla       bool
+
+	groupMu       sync.Mutex
+	groupMin      chan int
+	mergedGroups  []*prog.Group
+	newGroups     []*prog.Group
+	maxGroupID    uint64
+	strategies    []prog.Strategy
+	llvmLookup    *evtrack.LLVMLookup
+
+	addrMu       sync.Mutex
+	addrIn       io.WriteCloser
+	addrOut      io.ReadCloser
+	cacheMu      sync.Mutex
+	subsysCache  map[uint32]string
+	apiCache     map[uint32]bool
+	subsysProbs  map[string]float64
+	subsysStats  map[string]uint64
+	groupsDropp  uint64
+	groupsKept   uint64
+	cacheMisses  uint64
+	cacheHit     uint64
+
+	statsMu           sync.Mutex
+	shared_objects    uint64
+	shared_accesses   uint64
+	shared_acc_subsys map[string]uint64
+	single_acc        uint64
 }
 
 type Fuzzer struct {
@@ -47,6 +82,11 @@ type Fuzzer struct {
 	newMaxSignal  signal.Signal
 	rotatedSignal signal.Signal
 	machineInfo   []byte
+	groups        map[uint64]*prog.Group
+	used          map[uint64]bool
+	changes       map[uint64]prog.Result
+	inactive      map[uint64]bool
+	ivshmem       []byte
 }
 
 type BugFrames struct {
@@ -66,12 +106,18 @@ type RPCManagerView interface {
 
 func startRPCServer(mgr *Manager) (*RPCServer, error) {
 	serv := &RPCServer{
-		mgr:     mgr,
-		cfg:     mgr.cfg,
-		stats:   mgr.stats,
-		fuzzers: make(map[string]*Fuzzer),
-		rnd:     rand.New(rand.NewSource(time.Now().UnixNano())),
+		mgr:         mgr,
+		cfg:         mgr.cfg,
+		unpackedCfg: mgr.loadCfg(),
+		stats:       mgr.stats,
+		fuzzers:     make(map[string]*Fuzzer),
+		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
+		groupMin:    make(chan int, 1),
+		vanilla:     mgr.cfg.Vanilla,
 	}
+	mgr.rpcserv = serv
+	serv.initEvtrack(mgr.crashdir, serv.unpackedCfg["workdir"])
+
 	serv.batchSize = 5
 	if serv.batchSize < mgr.cfg.Procs {
 		serv.batchSize = mgr.cfg.Procs
@@ -100,10 +146,33 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	serv.mu.Lock()
 	defer serv.mu.Unlock()
 
+	// check whether fuzzer with this name exists already, then unmap sharedmem
+	old := serv.fuzzers[a.Name]
+	if old != nil {
+		err := ivshmem.UnmapHostIvshmem(old.ivshmem)
+		if err != nil {
+			log.Fatalf("Unmap failed: %v", err)
+		}
+		delete(serv.fuzzers, a.Name)
+		old.changes = nil
+		old.groups =  nil
+	}
+
 	f := &Fuzzer{
 		name:        a.Name,
 		machineInfo: a.MachineInfo,
+		groups:      make(map[uint64]*prog.Group),
+		changes:     make(map[uint64]prog.Result),
+		used:        make(map[uint64]bool),
+		inactive:   make(map[uint64]bool),
 	}
+
+	f.ivshmem, err = ivshmem.GetSharedMappingHost(fmt.Sprintf("/dev/shm/ivshmemfile%s", a.Name))
+	if err != nil {
+		fmt.Println(err)
+		panic("mmap failed")
+	}
+
 	serv.fuzzers[a.Name] = f
 	r.MemoryLeakFrames = bugFrames.memoryLeaks
 	r.DataRaceFrames = bugFrames.dataRaces
@@ -111,6 +180,34 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 	r.EnabledCalls = serv.cfg.Syscalls
 	r.GitRevision = prog.GitRevision
 	r.TargetRevision = serv.cfg.Target.Revision
+	if !serv.vanilla {
+		// choose x groups for fuzzer
+		serv.groupMu.Lock()
+		if len(serv.mergedGroups) > 0 {
+			if len(serv.mergedGroups) < prog.GROUPS_PER_VM {
+				for i := 0; i < len(serv.mergedGroups); i++ {
+					grp := serv.mergedGroups[i]
+					f.groups[grp.ID] = grp
+					f.changes[grp.ID] = prog.Result{Res: grp, Changed: true}
+				}
+			} else {
+				min := 0
+				max := len(serv.mergedGroups)
+				rnds := serv.rnd.Perm(max)
+				for i := 0; i < prog.GROUPS_PER_VM; i++ {
+					ind := min + rnds[i]
+					grp := serv.mergedGroups[ind]
+					if _, present := f.groups[grp.ID]; !present {
+						f.groups[grp.ID] = grp
+						f.changes[grp.ID] = prog.Result{Res: grp, Changed: true}
+					}
+				}
+			}
+		}
+		serv.groupMu.Unlock()
+
+		log.Logf(0, "Added %v groups to %v's changed list", len(f.groups), f.name)
+	}
 	if serv.mgr.rotateCorpus() && serv.rnd.Intn(5) == 0 {
 		// We do rotation every other time because there are no objective
 		// proofs regarding its efficiency either way.
@@ -123,6 +220,25 @@ func (serv *RPCServer) Connect(a *rpctype.ConnectArgs, r *rpctype.ConnectRes) er
 		f.newMaxSignal = serv.maxSignal.Copy()
 	}
 	return nil
+}
+
+func (f *Fuzzer) assignAdditionalGroups(serv *RPCServer) {
+	// choose x groups for fuzzer
+	serv.groupMu.Lock()
+	min := 0
+	max := len(serv.mergedGroups)
+	rnds := serv.rnd.Perm(max)
+	for i := 0; i < max && len(f.groups) < max && len(f.groups) < prog.GROUPS_PER_VM; i++ {
+		ind := min + rnds[i]
+		grp := serv.mergedGroups[ind]
+		_, present := f.groups[grp.ID]
+		_, inactive := f.inactive[grp.ID]
+		if !present && !inactive {
+			f.groups[grp.ID] = grp
+			f.changes[grp.ID] = prog.Result{Res: grp, Changed: true}
+		}
+	}
+	serv.groupMu.Unlock()
 }
 
 func (serv *RPCServer) rotateCorpus(f *Fuzzer, corpus []rpctype.Input) *rpctype.CheckArgs {
@@ -313,6 +429,161 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	return nil
 }
 
+func readU64(data []byte) uint64 {
+	return binary.LittleEndian.Uint64(data)
+}
+
+func writeU64(data []byte, num uint64) {
+	binary.LittleEndian.PutUint64(data, num)
+}
+
+func (serv *RPCServer) GetStrategies(a *rpctype.GetStratArg, r *rpctype.GetStratRes) error {
+	serv.mu.Lock()
+	defer serv.mu.Unlock()
+
+	f := serv.fuzzers[a.Name]
+	if f == nil {
+		log.Fatalf("fuzzer %v is not connected", a.Name)
+	}
+
+	writeU64(f.ivshmem, uint64(0))
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(serv.strategies)
+	if err != nil {
+		log.Fatalf("Encoding of strategies failed: %v", err)
+	}
+	n := buf.Len()
+	if n != copy(f.ivshmem[8:], buf.Bytes()) {
+		r.Len = 0
+		log.Fatalf("buffer was too small for strategies")
+	}
+	r.Len = uint64(n)
+
+	return nil
+}
+
+func (serv *RPCServer) PollNew(a *rpctype.PollArgsNew, r *rpctype.PollResNew) error {
+	serv.stats.mergeNamed(a.Stats)
+
+	serv.mu.Lock()
+	defer serv.mu.Unlock()
+
+	f := serv.fuzzers[a.Name]
+	if f == nil {
+		log.Fatalf("fuzzer %v is not connected", a.Name)
+	}
+	serv.statsMu.Lock()
+	for id := range a.NewUsed {
+		f.used[id] = true
+	}
+	serv.statsMu.Unlock()
+	newMaxSignal := serv.maxSignal.Diff(a.MaxSignal.Deserialize())
+	if !newMaxSignal.Empty() {
+		serv.maxSignal.Merge(newMaxSignal)
+		// read data from ivshmem
+		for readU64(f.ivshmem) != 1 {}
+		if a.EvtLen != 0 {
+			batch := evtrack.DecodeBatchPb(f.ivshmem[8:(8+a.EvtLen)])
+			go serv.add_groups(batch.Events)
+		}
+
+		for _, f1 := range serv.fuzzers {
+			if f1 == f {
+				continue
+			}
+			f1.newMaxSignal.Merge(newMaxSignal)
+		}
+	}
+	// some groups have syscalls that cannot be used by the VM
+	toBeDeleted := make([]uint64, 0)
+	for _, id := range a.DeletedIDs {
+		delete(f.groups, id)
+		ch, present := f.changes[id]
+		if present {
+			toBeDeleted = append(toBeDeleted, ch.Deleted...)
+			delete(f.changes, id)
+		}
+		f.inactive[id] = true
+	}
+	// if fuzzer does not yet have x groups, assign additional groups
+	if len(f.groups) < prog.GROUPS_PER_VM {
+		f.assignAdditionalGroups(serv)
+	}
+
+	if len(toBeDeleted) > 0 {
+		// this means we deleted at least 1 group, therefore we need to add a new one
+		if len(f.changes) == 0 {
+			panic("need to delete this stuff but cannot")
+		}
+		for id := range f.changes {
+			ch := f.changes[id]
+			ch.Deleted = append(ch.Deleted, toBeDeleted...)
+			f.changes[id] = ch
+			break
+		}
+	}
+	// write data to ivshmem
+	changes := make([]prog.Result, 0)
+	ind := 0
+	for _, res := range f.changes {
+		if ind == 50 {
+			break
+		}
+		changes = append(changes, res)
+		ind++
+	}
+	for _, res := range changes {
+		delete(f.changes, res.Res.ID)
+	}
+
+	writeU64(f.ivshmem, uint64(0))
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(changes)
+	if err != nil {
+		log.Fatalf("Encoding of groups failed: %v", err)
+	}
+	n := buf.Len()
+	if n != copy(f.ivshmem[8:], buf.Bytes()) {
+		r.ChangeLen = 0
+		log.Fatalf("buffer was too small for changed")
+	}
+	r.ChangeLen = uint64(n)
+
+	writeU64(f.ivshmem[8+n:], uint64(0))
+
+	r.MaxSignal = f.newMaxSignal.Split(500).Serialize()
+	if a.NeedCandidates {
+		r.Candidates = serv.mgr.candidateBatch(serv.batchSize)
+	}
+	if len(r.Candidates) == 0 {
+		batchSize := serv.batchSize
+		// When the fuzzer starts, it pumps the whole corpus.
+		// If we do it using the final batchSize, it can be very slow
+		// (batch of size 6 can take more than 10 mins for 50K corpus and slow kernel).
+		// So use a larger batch initially (we use no stats as approximation of initial pump).
+		const initialBatch = 30
+		if len(a.Stats) == 0 && batchSize < initialBatch {
+			batchSize = initialBatch
+		}
+		for i := 0; i < batchSize && len(f.inputs) > 0; i++ {
+			last := len(f.inputs) - 1
+			r.NewInputs = append(r.NewInputs, f.inputs[last])
+			f.inputs[last] = rpctype.Input{}
+			f.inputs = f.inputs[:last]
+		}
+		if len(f.inputs) == 0 {
+			f.inputs = nil
+		}
+	}
+	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v maxgroups=%v",
+		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems), len(changes))
+	return nil
+}
+
+
+
 func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 	serv.stats.mergeNamed(a.Stats)
 
@@ -329,6 +600,7 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 	newMaxSignal := serv.maxSignal.Diff(a.MaxSignal.Deserialize())
 	if !newMaxSignal.Empty() {
 		serv.maxSignal.Merge(newMaxSignal)
+		serv.add_groups(a.MaxEvents)
 		serv.stats.maxSignal.set(len(serv.maxSignal))
 		for _, f1 := range serv.fuzzers {
 			if f1 == f || f1.rotated {
@@ -341,6 +613,7 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 		// Let rotated VMs run in isolation, don't send them anything.
 		return nil
 	}
+
 	r.MaxSignal = f.newMaxSignal.Split(2000).Serialize()
 	if a.NeedCandidates {
 		r.Candidates = serv.mgr.candidateBatch(serv.batchSize)
@@ -365,8 +638,8 @@ func (serv *RPCServer) Poll(a *rpctype.PollArgs, r *rpctype.PollRes) error {
 			f.inputs = nil
 		}
 	}
-	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v",
-		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems))
+	log.Logf(4, "poll from %v: candidates=%v inputs=%v maxsignal=%v maxgroups=%v",
+		a.Name, len(r.Candidates), len(r.NewInputs), len(r.MaxSignal.Elems), len(r.ChangedGroups))
 	return nil
 }
 

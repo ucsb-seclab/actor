@@ -79,6 +79,7 @@ const (
 	MemoryLeak
 	DataRace
 	UnexpectedReboot
+	BailOut
 )
 
 func (t Type) String() string {
@@ -93,6 +94,8 @@ func (t Type) String() string {
 		return "DATARACE"
 	case UnexpectedReboot:
 		return "REBOOT"
+	case BailOut:
+		return "BAILOUT"
 	default:
 		panic("unknown report type")
 	}

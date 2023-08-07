@@ -34,12 +34,12 @@ func AssignRandomAsync(origProg *Prog, rand *rand.Rand) *Prog {
 			if !ok {
 				return
 			}
-			if res.Dir() != DirIn && unassigned[res] {
+			if res.GetDir() != DirIn && unassigned[res] {
 				// If this call is made async, at least one of the resources
 				// will be empty when it's needed.
 				producesUnassigned = true
 			}
-			if res.Dir() != DirOut {
+			if res.GetDir() != DirOut {
 				consumes[res.Res] = true
 			}
 		})

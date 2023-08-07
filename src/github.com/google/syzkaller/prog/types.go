@@ -111,6 +111,7 @@ type Type interface {
 	DefaultArg(dir Dir) Arg
 	isDefaultArg(arg Arg) bool
 	generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call)
+	generateEv(r *randGen, s *state, prevArg Arg, biasCall *Call, dir Dir) (arg Arg, calls []*Call)
 	mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool)
 	getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool)
 	minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool
@@ -139,6 +140,7 @@ func (ti Ref) DefaultArg(dir Dir) Arg                                { panic("pr
 func (ti Ref) Clone() Type                                           { panic("prog.Ref method called") }
 func (ti Ref) isDefaultArg(arg Arg) bool                             { panic("prog.Ref method called") }
 func (ti Ref) generate(r *randGen, s *state, dir Dir) (Arg, []*Call) { panic("prog.Ref method called") }
+func (ti Ref) generateEv(r *randGen, s *state, prevArg Arg, biasCall *Call, dir Dir) (Arg, []*Call) { panic("prog.Ref method called") }
 func (ti Ref) mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) ([]*Call, bool, bool) {
 	panic("prog.Ref method called")
 }
@@ -538,7 +540,7 @@ func (t *BufferType) isDefaultArg(arg Arg) bool {
 	if a.Size() != sz {
 		return false
 	}
-	if a.Dir() == DirOut {
+	if a.GetDir() == DirOut {
 		return true
 	}
 	if len(t.Values) == 1 {

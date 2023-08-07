@@ -184,6 +184,8 @@ func (mgr *Manager) boot(name string, index int) (*report.Report, error) {
 		Procs:     mgr.cfg.Procs,
 		Verbosity: 0,
 		Cover:     mgr.cfg.Cover,
+		Event:     mgr.cfg.Event,
+		Vanilla:   mgr.cfg.Vanilla,
 		Debug:     mgr.debug,
 		Test:      false,
 		Runtest:   true,

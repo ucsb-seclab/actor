@@ -52,6 +52,7 @@ type Instance struct {
 var (
 	Shutdown               = vmimpl.Shutdown
 	ErrTimeout             = vmimpl.ErrTimeout
+	ErrBailOut             = vmimpl.ErrBailOut
 	_          BootErrorer = vmimpl.BootError{}
 )
 
@@ -240,6 +241,12 @@ func (mon *monitor) monitorExecution() *report.Report {
 					return mon.extractError(timeoutCrash)
 				}
 				return nil
+			case ErrBailOut:
+				rep := &report.Report{
+					Title: bailOutCrash,
+					Type:  report.BailOut,
+				}
+				return rep
 			default:
 				// Note: connection lost can race with a kernel oops message.
 				// In such case we want to return the kernel oops.
@@ -378,6 +385,7 @@ const (
 	timeoutCrash        = "timed out"
 	fuzzerPreemptedStr  = "SYZ-FUZZER: PREEMPTED"
 	vmDiagnosisStart    = "\nVM DIAGNOSIS:\n"
+	bailOutCrash        = "fuzzer bailed out voluntarily" // To aid debugging
 )
 
 var (

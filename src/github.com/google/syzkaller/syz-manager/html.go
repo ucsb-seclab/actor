@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"runtime"

@@ -19,6 +19,7 @@
 #include <unistd.h>
 #endif
 
+#include <sys/types.h>
 #include "defs.h"
 
 #if defined(__GNUC__)
@@ -71,6 +72,7 @@ const int kInPipeFd = kMaxFd - 1; // remapped from stdin
 const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
 const int kCoverFd = kOutPipeFd - kMaxThreads;
 const int kExtraCoverFd = kCoverFd - 1;
+const int kEventFd = kExtraCoverFd - kMaxThreads;
 const int kMaxArgs = 9;
 const int kCoverSize = 256 << 10;
 const int kFailStatus = 67;
@@ -130,9 +132,10 @@ const uint64 kOutputBase = 0x1b2bc20000ull;
 #if SYZ_EXECUTOR_USES_FORK_SERVER
 // Allocating (and forking) virtual memory for each executed process is expensive, so we only mmap
 // the amount we might possibly need for the specific received prog.
-const int kMaxOutputComparisons = 14 << 20; // executions with comparsions enabled are usually < 1% of all executions
-const int kMaxOutputCoverage = 6 << 20; // coverage is needed in ~ up to 1/3 of all executions (depending on corpus rotation)
-const int kMaxOutputSignal = 4 << 20;
+const int kMaxOutputComparisons = 18 << 20; // executions with comparsions enabled are usually < 1% of all executions
+const int kMaxOutputCoverage = 10 << 20; // coverage is needed in ~ up to 1/3 of all executions (depending on corpus rotation)
+const int kMaxOutputSignal = 8 << 20;
+const int kMaxOutputEvent = 4 << 20;
 const int kMinOutput = 256 << 10; // if we don't need to send signal, the output is rather short.
 const int kInitialOutput = kMinOutput; // the minimal size to be allocated in the parent process
 #else
@@ -180,6 +183,7 @@ static bool flag_collect_signal;
 static bool flag_dedup_cover;
 static bool flag_threaded;
 static bool flag_coverage_filter;
+static bool flag_collect_event;
 
 // If true, then executor should write the comparisons data to fuzzer.
 static bool flag_comparisons;
@@ -257,6 +261,12 @@ struct cover_t {
 	intptr_t pc_offset;
 };
 
+struct evtrack_t {
+	int fd;
+	uint32 size;
+	struct evtrack_event* events;
+};
+
 struct thread_t {
 	int id;
 	bool created;
@@ -274,6 +284,7 @@ struct thread_t {
 	uint32 reserrno;
 	bool fault_injected;
 	cover_t cov;
+	evtrack_t ev;
 	bool soft_fail_state;
 };
 
@@ -369,6 +380,8 @@ struct feature_t {
 	void (*setup)();
 };
 
+static int exec_id;
+
 static thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint64 num_args, uint64* args, uint64* pos, call_props_t call_props);
 static void handle_completion(thread_t* th);
 static void copyout_call_results(thread_t* th);
@@ -447,6 +460,8 @@ int main(int argc, char** argv)
 	}
 
 	start_time_ms = current_time_ms();
+	srand(time(0));
+	exec_id = rand();
 
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
 	current_thread = &threads[0];
@@ -474,6 +489,7 @@ int main(int argc, char** argv)
 #else
 	receive_execute();
 #endif
+	debug("executor launched pid %d, exec_id %d\n", getpid(), exec_id);
 	if (flag_coverage) {
 		int create_count = kCoverDefaultCount, mmap_count = create_count;
 		if (flag_delay_kcov_mmap) {
@@ -510,6 +526,13 @@ int main(int argc, char** argv)
 		strncat(filename, "syz-cover-bitmap", 17);
 		filename[sizeof(filename) - 1] = '\0';
 		init_coverage_filter(filename);
+	}
+
+	if (flag_collect_event) {
+		for (int i = 0; i < kMaxThreads; i++) {
+			threads[i].ev.fd = kEventFd + i;
+			evtrack_open(&threads[i].ev);
+		}
 	}
 
 	int status = 0;
@@ -614,6 +637,7 @@ void parse_env_flags(uint64 flags)
 	flag_vhci_injection = flags & (1 << 12);
 	flag_wifi = flags & (1 << 13);
 	flag_delay_kcov_mmap = flags & (1 << 14);
+	flag_collect_event = flags & (1 << 15);
 }
 
 #if SYZ_EXECUTOR_USES_FORK_SERVER
@@ -661,11 +685,12 @@ void receive_execute()
 	flag_threaded = req.exec_flags & (1 << 4);
 	flag_coverage_filter = req.exec_flags & (1 << 5);
 
-	debug("[%llums] exec opts: procid=%llu threaded=%d cover=%d comps=%d dedup=%d signal=%d"
-	      " timeouts=%llu/%llu/%llu prog=%llu filter=%d\n",
+	debug("[DEBUG] [%llums] exec opts: procid=%llu threaded=%d cover=%d comps=%d event=%d dedup=%d"
+	      " signal=%d timeouts=%llu/%llu/%llu prog=%llu filter=%d\n exec_id=%d",
 	      current_time_ms() - start_time_ms, procid, flag_threaded, flag_collect_cover,
-	      flag_comparisons, flag_dedup_cover, flag_collect_signal, syscall_timeout_ms,
-	      program_timeout_ms, slowdown_scale, req.prog_size, flag_coverage_filter);
+	      flag_comparisons, flag_collect_event, flag_dedup_cover, flag_collect_signal,
+	      syscall_timeout_ms, program_timeout_ms, slowdown_scale, req.prog_size,
+	      flag_coverage_filter, exec_id);
 	if (syscall_timeout_ms == 0 || program_timeout_ms <= syscall_timeout_ms || slowdown_scale == 0)
 		failmsg("bad timeouts", "syscall=%llu, program=%llu, scale=%llu",
 			syscall_timeout_ms, program_timeout_ms, slowdown_scale);
@@ -725,6 +750,8 @@ void realloc_output_data()
 		mmap_output(kMaxOutputCoverage);
 	else if (flag_collect_signal)
 		mmap_output(kMaxOutputSignal);
+	else if (flag_collect_event)
+		mmap_output(kMaxOutputEvent);
 	if (close(kOutFd) < 0)
 		fail("failed to close kOutFd");
 #endif
@@ -747,6 +774,11 @@ void execute_one()
 			cover_enable(&threads[0].cov, flag_comparisons, false);
 		if (flag_extra_coverage)
 			cover_reset(&extra_cov);
+	}
+
+	if (flag_collect_event) {
+		if (!flag_threaded)
+			evtrack_enable(&threads[0].ev);
 	}
 
 	int call_index = 0;
@@ -898,7 +930,13 @@ void execute_one()
 			if (th != &threads[0])
 				fail("using non-main thread in non-thread mode");
 			event_reset(&th->ready);
+
+			if (flag_collect_event)
+				evtrack_enable(&th->ev);
 			execute_call(th);
+			if (flag_collect_event)
+				evtrack_stop(&th->ev);
+
 			event_set(&th->done);
 			handle_completion(th);
 		}
@@ -927,15 +965,28 @@ void execute_one()
 				if (th->executing) {
 					if (cover_collection_required())
 						cover_collect(&th->cov);
+					if (flag_collect_event)
+						evtrack_collect(&th->ev);
 					write_call_output(th, false);
 				}
 			}
 		}
 	}
 
+	for (int i = 0; i < kMaxThreads; i++) {
+		thread_t* th = &threads[i];
+		evtrack_disable(&th->ev);
+	}
+
 #if SYZ_HAVE_CLOSE_FDS
 	close_fds();
 #endif
+
+	debug("[DEBUG]: check_flags => flag_collect_event=%d, running=%d, flag_threaded=%d,"
+			" events=%lu, prog_extra_cover_timeout=%llu\n",
+			flag_collect_event, running, flag_threaded,
+			threads[0].ev.events->size, prog_extra_cover_timeout);
+
 
 	write_extra_output();
 	// Check for new extra coverage in small intervals to avoid situation
@@ -965,6 +1016,7 @@ thread_t* schedule_call(int call_index, int call_num, uint64 copyout_index, uint
 	if (i == kMaxThreads)
 		exitf("out of threads");
 	thread_t* th = &threads[i];
+	debug("[DEBUG]: Thread %d is being scheduled\n", i);
 	if (event_isset(&th->ready) || !event_isset(&th->done) || th->executing)
 		failmsg("bad thread state in schedule", "ready=%d done=%d executing=%d",
 			event_isset(&th->ready), event_isset(&th->done), th->executing);
@@ -1030,6 +1082,44 @@ void write_coverage_signal(cover_t* cov, uint32* signal_count_pos, uint32* cover
 		for (uint32 i = 0; i < cover_size; i++)
 			write_output(cover_data[i] + cov->pc_offset);
 		*cover_count_pos = cover_size;
+	}
+}
+
+void write_event(evtrack_event* event)
+{
+	uint32 nr_trace, ts;
+
+	write_output(event->event_id);
+	write_output(event->type);
+	write_output((uint32)event->ptr);
+	write_output(((uint32)(event->ptr >> 32)));
+	write_output((uint32)event->size);
+	write_output(((uint32)(event->size >> 32)));
+	nr_trace = event->nr_trace;
+	write_output(nr_trace);
+	ts = (uint32)event->timestamp;
+	write_output(ts);
+	ts = (uint32)(event->timestamp >> 32);
+	write_output(ts);
+	write_output(event->obj_id);
+	write_output((uint32)event->instr_id);
+
+	for (uint32 i = 0; i < nr_trace; i++) {
+		write_output((uint32)event->trace[i]);
+	}
+}
+
+
+void write_event_signal(evtrack_t* ev, uint32* events_count_pos)
+	  {
+	// Write out event signals.
+	*events_count_pos = ev->size;
+	debug("executor recorded %d events\n", ev->size);
+	struct evtrack_event* event = ev->events + 1;
+
+	for (uint32 i = 0; i < ev->size; i++) {
+		write_event(event++);
+		write_output(0xdeadbeef);
 	}
 }
 #endif
@@ -1113,6 +1203,7 @@ void write_call_output(thread_t* th, bool finished)
 	uint32* signal_count_pos = write_output(0); // filled in later
 	uint32* cover_count_pos = write_output(0); // filled in later
 	uint32* comps_count_pos = write_output(0); // filled in later
+	uint32* events_count_pos = write_output(0); // filled in later
 
 	if (flag_comparisons) {
 		// Collect only the comparisons
@@ -1140,9 +1231,13 @@ void write_call_output(thread_t* th, bool finished)
 		else
 			write_coverage_signal<uint32>(&th->cov, signal_count_pos, cover_count_pos);
 	}
-	debug_verbose("out #%u: index=%u num=%u errno=%d finished=%d blocked=%d sig=%u cover=%u comps=%u\n",
+
+	if (flag_collect_event)
+		write_event_signal(&th->ev, events_count_pos);
+
+	debug_verbose("out #%u: index=%u num=%u errno=%d finished=%d blocked=%d sig=%u cover=%u comps=%u events%u\n",
 		      completed, th->call_index, th->call_num, reserrno, finished, blocked,
-		      *signal_count_pos, *cover_count_pos, *comps_count_pos);
+		      *signal_count_pos, *cover_count_pos, *comps_count_pos, *events_count_pos);
 	completed++;
 	write_completed(completed);
 #else
@@ -1228,7 +1323,12 @@ void* worker_thread(void* arg)
 	for (;;) {
 		event_wait(&th->ready);
 		event_reset(&th->ready);
+		debug("[DEBUG]: Worker %d in action\n", th->id);
+		if (flag_collect_event)
+			evtrack_enable(&th->ev);
 		execute_call(th);
+		if (flag_collect_event)
+			evtrack_stop(&th->ev);
 		event_set(&th->done);
 	}
 	return 0;
@@ -1237,8 +1337,8 @@ void* worker_thread(void* arg)
 void execute_call(thread_t* th)
 {
 	const call_t* call = &syscalls[th->call_num];
-	debug("#%d [%llums] -> %s(",
-	      th->id, current_time_ms() - start_time_ms, call->name);
+	debug("#%d,%d [%llums] -> %s(",
+	      th->id, getpid(), current_time_ms() - start_time_ms, call->name);
 	for (int i = 0; i < th->num_args; i++) {
 		if (i != 0)
 			debug(", ");
@@ -1257,6 +1357,8 @@ void execute_call(thread_t* th)
 
 	if (flag_coverage)
 		cover_reset(&th->cov);
+	if (flag_collect_event)
+		evtrack_reset(&th->ev);
 	// For pseudo-syscalls and user-space functions NONFAILING can abort before assigning to th->res.
 	// Arrange for res = -1 and errno = EFAULT result for such case.
 	th->res = -1;
@@ -1274,6 +1376,8 @@ void execute_call(thread_t* th)
 		if (th->cov.size >= kCoverSize)
 			failmsg("too much cover", "thr=%d, cov=%u", th->id, th->cov.size);
 	}
+	if (flag_collect_event)
+		evtrack_collect(&th->ev);
 	th->fault_injected = false;
 
 	if (th->call_props.fail_nth > 0)
@@ -1284,12 +1388,14 @@ void execute_call(thread_t* th)
 	for (int i = 0; i < th->call_props.rerun; i++)
 		NONFAILING(execute_syscall(call, th->args));
 
-	debug("#%d [%llums] <- %s=0x%llx",
-	      th->id, current_time_ms() - start_time_ms, call->name, (uint64)th->res);
+	debug("#%d,%d [%llums] <- %s=0x%llx",
+	      th->id, getpid(), current_time_ms() - start_time_ms, call->name, (uint64)th->res);
 	if (th->res == (intptr_t)-1)
 		debug(" errno=%d", th->reserrno);
 	if (flag_coverage)
 		debug(" cover=%u", th->cov.size);
+	if (flag_collect_event)
+		debug("event=%u ", th->ev.size);
 	if (th->call_props.fail_nth > 0)
 		debug(" fault=%d", th->fault_injected);
 	if (th->call_props.rerun > 0)

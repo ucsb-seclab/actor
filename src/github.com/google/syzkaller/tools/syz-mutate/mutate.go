@@ -67,7 +67,7 @@ func main() {
 	ct := target.BuildChoiceTable(corpus, syscalls)
 	var p *prog.Prog
 	if flag.NArg() == 0 {
-		p = target.Generate(rs, *flagLen, ct)
+		p = target.Generate(rs, *flagLen, ct, prog.InitEvTrackState())
 	} else {
 		data, err := ioutil.ReadFile(flag.Arg(0))
 		if err != nil {
@@ -79,7 +79,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to deserialize the program: %v\n", err)
 			os.Exit(1)
 		}
-		p.Mutate(rs, *flagLen, ct, corpus)
+		p.Mutate(rs, *flagLen, ct, corpus, prog.InitEvTrackState())
 	}
 	fmt.Printf("%s\n", p.Serialize())
 }

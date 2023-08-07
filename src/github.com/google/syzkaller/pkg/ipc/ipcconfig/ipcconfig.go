@@ -15,6 +15,7 @@ var (
 	flagExecutor = flag.String("executor", "./syz-executor", "path to executor binary")
 	flagThreaded = flag.Bool("threaded", true, "use threaded mode in executor")
 	flagSignal   = flag.Bool("cover", false, "collect feedback signals (coverage)")
+	flagEvent    = flag.Bool("event", false, "collect event coverage")
 	flagSandbox  = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
 	flagDebug    = flag.Bool("debug", false, "debug output from executor")
 	flagSlowdown = flag.Int("slowdown", 1, "execution slowdown caused by emulation/instrumentation")
@@ -28,6 +29,9 @@ func Default(target *prog.Target) (*ipc.Config, *ipc.ExecOpts, error) {
 	}
 	if *flagSignal {
 		c.Flags |= ipc.FlagSignal
+	}
+	if *flagEvent {
+		c.Flags |= ipc.FlagEvent
 	}
 	if *flagDebug {
 		c.Flags |= ipc.FlagDebug

@@ -1,0 +1,94 @@
+syntax = "proto3";
+package oookfuzz;
+
+option go_package = "evtrack/protobuf";
+
+message Arg {
+  uint32 ref = 1;
+  uint32 dir = 2; // there is no uint8
+  oneof subtype {
+    PointerArg ptr_arg = 3;
+    GroupArg group_arg = 4;
+    ConstArg const_arg = 5;
+    UnionArg union_arg = 6;
+    ResultArg res_arg = 7;
+    DataArg data_arg = 8;
+  }
+
+  message PointerArg {
+    uint64 address = 1;
+    uint64 vma_size = 2;
+    Arg res = 3;
+  }
+
+  message GroupArg {
+    repeated Arg inner = 1;
+  }
+
+  message ConstArg {
+    uint64 val = 1;
+  }
+
+  message UnionArg {
+    Arg arg_option = 1; // option is a keyword in protobuf
+    int32 index = 2;
+  }
+
+  message ResultArg {
+    optional ResultArg res = 1;
+    uint64 op_div = 2;
+    uint64 op_add = 3;
+    uint64 val = 4;
+  }
+
+  message DataArg {
+    bytes data = 1;
+    uint64 size = 2;
+  }
+}
+
+message EvtrackEvent {
+  uint32 event_id = 1;
+  uint32 event_type = 2;
+  uint64 ptr = 3;
+  uint32 size = 4;
+  uint32 num_trace = 5;
+  // TimeStamp is not used
+  // ObjId is not used
+  // InstrId is not used
+  repeated uint32 trace = 6;
+  string syscall = 7;
+  repeated Arg args = 8;
+}
+
+message EventsList {
+  repeated EvtrackEvent events = 1;
+}
+
+message Batch {
+  // size is only required for efficiency inside the vm
+  repeated EventsList evts = 1;
+}
+
+message Group {
+  uint64 id = 1;
+  uint32 num_groups = 2;
+  repeated EventsList events = 3;
+}
+
+message ChangedGroups {
+  repeated Group groups = 1;
+}
+
+message DeletedGroups {
+  repeated uint64 deleted = 1;
+}
+
+message Program {
+  repeated string syscalls = 1;
+}
+
+message Programs {
+  repeated Program progs = 1;
+}
+

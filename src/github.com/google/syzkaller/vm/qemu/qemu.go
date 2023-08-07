@@ -410,6 +410,8 @@ func (inst *instance) boot() error {
 		"-display", "none",
 		"-serial", "stdio",
 		"-no-reboot",
+		"-object", fmt.Sprintf("memory-backend-file,size=512M,share,mem-path=/dev/shm/ivshmemfilevm-%v,id=ivshmem", inst.index),
+		"-device","ivshmem-plain,memdev=ivshmem",
 		"-name", fmt.Sprintf("VM-%v", inst.index),
 	}
 	if inst.archConfig.RngDev != "" {

@@ -15,6 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bytes"
+	"encoding/binary"
+	"encoding/gob"
+	"syscall"
+
 	"github.com/google/syzkaller/pkg/csource"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/host"
@@ -25,9 +30,11 @@ import (
 	"github.com/google/syzkaller/pkg/rpctype"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/pkg/tool"
+	"github.com/google/syzkaller/pkg/evtrack"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 	"github.com/google/syzkaller/sys/targets"
+	"github.com/google/syzkaller/pkg/ivshmem"
 )
 
 type Fuzzer struct {
@@ -43,6 +50,7 @@ type Fuzzer struct {
 	stats             [StatCount]uint64
 	manager           *rpctype.RPCClient
 	target            *prog.Target
+	calls             map[*prog.Syscall]bool
 	triagedCandidates uint32
 	timeouts          targets.Timeouts
 
@@ -60,9 +68,19 @@ type Fuzzer struct {
 	corpusSignal signal.Signal // signal of inputs in corpus
 	maxSignal    signal.Signal // max signal ever observed including flakes
 	newSignal    signal.Signal // diff of maxSignal since last sync with master
+	evState      *prog.EvTrackState // state of evtrack, groups and choice table
+	eventsMu     sync.RWMutex
+	batches      []prog.Batch
+	hasBatch     chan bool
+	numEvents    uint64
+	evDropRate   int
+	vanilla      bool
+	banned       map[string]bool
+	deletedIDs   []uint64
 
 	checkResult *rpctype.CheckArgs
 	logMu       sync.Mutex
+	ivshmem     []byte
 }
 
 type FuzzerSnapshot struct {
@@ -136,6 +154,15 @@ func createIPCConfig(features *host.Features, config *ipc.Config) {
 
 // nolint: funlen
 func main() {
+
+	// gob requires registration of interface types
+	gob.RegisterName("github.com/google/syzkaller/prog.PointerArg", &prog.PointerArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.ResultArg", &prog.ResultArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.GroupArg", &prog.GroupArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.DataArg", &prog.DataArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.ConstArg", &prog.ConstArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.UnionArg", &prog.UnionArg{})
+
 	debug.SetGCPercent(50)
 
 	var (
@@ -148,10 +175,11 @@ func main() {
 		flagTest     = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
 		flagRunTest  = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
 		flagRawCover = flag.Bool("raw_cover", false, "fetch raw coverage")
+		flagVanilla  = flag.Bool("vanilla", false, "use vanilla call generation exclusively")
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
-	log.Logf(0, "fuzzer started")
+	log.Logf(0, "fuzzer started (pid=%v)", syscall.Getpid())
 
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
@@ -253,8 +281,14 @@ func main() {
 		return
 	}
 
+	calls := make(map[*prog.Syscall]bool)
+	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
+		calls[target.Syscalls[id]] = true
+	}
+
 	needPoll := make(chan struct{}, 1)
 	needPoll <- struct{}{}
+	hasBatch := make(chan bool, 800)
 	fuzzer := &Fuzzer{
 		name:                     *flagName,
 		outputType:               outputType,
@@ -264,27 +298,66 @@ func main() {
 		needPoll:                 needPoll,
 		manager:                  manager,
 		target:                   target,
+		calls:                    calls,
 		timeouts:                 timeouts,
 		faultInjectionEnabled:    r.CheckResult.Features[host.FeatureFault].Enabled,
 		comparisonTracingEnabled: r.CheckResult.Features[host.FeatureComparisons].Enabled,
 		corpusHashes:             make(map[hash.Sig]struct{}),
 		checkResult:              r.CheckResult,
 		fetchRawCover:            *flagRawCover,
+		evState:                  prog.InitEvTrackState(),
+		hasBatch:                 hasBatch,
+		vanilla:                  *flagVanilla,
+		banned:                   make(map[string]bool),
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
 
+	fuzzer.banned["lsetxattr$security_selinux"] = true
+	fuzzer.banned["openat"] = true
+	fuzzer.banned["mount"] = true
+	fuzzer.banned["chown"] = true
+	fuzzer.banned["ioctl$BLKTRACESETUP"] = true
+	fuzzer.banned["add_key$keyring"] = true
+	fuzzer.banned["openat$procfs"] = true
+	fuzzer.banned["ioctl$sock_SIOCGIFINDEX_80211"] = true
+	fuzzer.banned["syz_mount_image$tmpfs"] = true
+	fuzzer.banned["syz_clone3"] = true
+	fuzzer.banned["syz_mount_image$iso9660"] = true
+	fuzzer.banned["syz_mount_image$vfat"] = true
+	fuzzer.banned["syz_mount_image$ext4"] = true
+	fuzzer.banned["syz_open_dev$sg"] = true
+
+	// initialize shared memory
+	err = ivshmem.Load_module("/root/uio.ko")
+	if err != nil {
+		fmt.Println(err)
+		panic("load failed: uio.ko")
+	}
+	err = ivshmem.Load_module("/root/uio_ivshmem.ko")
+	if err != nil {
+		fmt.Println(err)
+		panic("load failed: uio_ivshmem.ko")
+	}
+	fuzzer.ivshmem, err = ivshmem.GetSharedMappingGuest("/dev/uio0")
+	if err != nil {
+		fmt.Println(err)
+		panic("mmap failed")
+	}
+
+	go fuzzer.updateEvDropRate()
+
 	for needCandidates, more := true, true; more; needCandidates = false {
-		more = fuzzer.poll(needCandidates, nil)
+		more = fuzzer.pollNew(needCandidates, nil, false)
 		// This loop lead to "no output" in qemu emulation, tell manager we are not dead.
 		log.Logf(0, "fetching corpus: %v, signal %v/%v (executing program)",
 			len(fuzzer.corpus), len(fuzzer.corpusSignal), len(fuzzer.maxSignal))
 	}
-	calls := make(map[*prog.Syscall]bool)
-	for _, id := range r.CheckResult.EnabledCalls[sandbox] {
-		calls[target.Syscalls[id]] = true
-	}
 	fuzzer.choiceTable = target.BuildChoiceTable(fuzzer.corpus, calls)
+	fuzzer.evState.BuildEvChoiceTable(target, calls)
+
+	// get additional strategies from the host
+	fuzzer.getStrategies()
 
 	if r.CoverFilterBitmap != nil {
 		fuzzer.execOpts.Flags |= ipc.FlagEnableCoverageFilter
@@ -372,19 +445,27 @@ func (fuzzer *Fuzzer) pollLoop() {
 	ticker := time.NewTicker(3 * time.Second * fuzzer.timeouts.Scale).C
 	for {
 		poll := false
+		hasBatch := false
 		select {
 		case <-ticker:
 		case <-fuzzer.needPoll:
 			poll = true
+			select {
+			case <-fuzzer.hasBatch:
+				hasBatch = true
+			default:
+			}
+		case <-fuzzer.hasBatch:
+			hasBatch = true
 		}
 		if fuzzer.outputType != OutputStdout && time.Since(lastPrint) > 10*time.Second*fuzzer.timeouts.Scale {
 			// Keep-alive for manager.
 			log.Logf(0, "alive, executed %v", execTotal)
 			lastPrint = time.Now()
 		}
-		if poll || time.Since(lastPoll) > 10*time.Second*fuzzer.timeouts.Scale {
+		if poll || hasBatch || time.Since(lastPoll) > 10*time.Second*fuzzer.timeouts.Scale {
 			needCandidates := fuzzer.workQueue.wantCandidates()
-			if poll && !needCandidates {
+			if poll && !needCandidates && !hasBatch {
 				continue
 			}
 			stats := make(map[string]uint64)
@@ -397,27 +478,90 @@ func (fuzzer *Fuzzer) pollLoop() {
 				stats[statNames[stat]] = v
 				execTotal += v
 			}
-			if !fuzzer.poll(needCandidates, stats) {
+			if !fuzzer.pollNew(needCandidates, stats, true) {
 				lastPoll = time.Now()
 			}
 		}
 	}
 }
 
-func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
-	a := &rpctype.PollArgs{
+func readU32(data []byte) uint32 {
+	return binary.LittleEndian.Uint32(data)
+}
+
+func readU64(data []byte) uint64 {
+	return binary.LittleEndian.Uint64(data)
+}
+
+func writeU64(data []byte, num uint64) {
+	binary.LittleEndian.PutUint64(data, num)
+}
+
+func (fuzzer *Fuzzer) getStrategies() {
+	a := &rpctype.GetStratArg{
+		Name: fuzzer.name,
+	}
+	r := &rpctype.GetStratRes{}
+	if err := fuzzer.manager.Call("Manager.GetStrategies", a, r); err != nil {
+		log.Fatalf("Manager.GetStrategies call failed: %v", err)
+	}
+	// read data from ivshmem
+	var strats []prog.Strategy
+	dec := gob.NewDecoder(bytes.NewBuffer(fuzzer.ivshmem[8:(8 + r.Len)]))
+	err := dec.Decode(&strats)
+	if err != nil {
+		log.Fatalf("Decoding groups failed: %v", err)
+	}
+	fuzzer.evState.AddStrategies(strats)
+}
+
+func (fuzzer *Fuzzer) pollNew(needCandidates bool, stats map[string]uint64, shouldBuildEvChoiceTable bool) bool {
+	a := &rpctype.PollArgsNew{
 		Name:           fuzzer.name,
 		NeedCandidates: needCandidates,
 		MaxSignal:      fuzzer.grabNewSignal().Serialize(),
 		Stats:          stats,
 	}
-	r := &rpctype.PollRes{}
-	if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
-		log.Fatalf("Manager.Poll call failed: %v", err)
+	maxEvents := fuzzer.grabNewEvents()
+	r := &rpctype.PollResNew{}
+	// write data to ivshmem
+	buf := evtrack.EncodeBatchPb(prog.Batch{Events: maxEvents})
+	n := len(buf)
+	m := copy(fuzzer.ivshmem[8:], buf)
+	if n != m {
+		evts := 0
+		for _, lst := range maxEvents {
+			evts += len(lst)
+		}
+		log.Fatalf("buffer was too small for %v events(%v executions): %v(%v) instead of %v", 
+			evts, len(maxEvents), m, len(fuzzer.ivshmem), n)
 	}
+	writeU64(fuzzer.ivshmem[(8+n):], uint64(0))
+	writeU64(fuzzer.ivshmem, uint64(1)) // signal for host that shared mem is updated
+	a.EvtLen = uint64(n)
+	a.NewUsed = fuzzer.evState.GetNewUsed()
+
+	a.DeletedIDs = fuzzer.deletedIDs
+
+	if err := fuzzer.manager.Call("Manager.PollNew", a, r); err != nil {
+		log.Fatalf("Manager.PollNew call failed: %v", err)
+	}
+	// read data from ivshmem
+	var changes []prog.Result
+	if !fuzzer.vanilla {
+		if r.ChangeLen != 0 {
+			dec := gob.NewDecoder(bytes.NewBuffer(fuzzer.ivshmem[8:(8 + r.ChangeLen)]))
+			err := dec.Decode(&changes)
+			if err != nil {
+				log.Fatalf("Decoding groups failed: %v", err)
+			}
+		}
+		fuzzer.deletedIDs = fuzzer.evState.Update(changes, fuzzer.target, fuzzer.calls, shouldBuildEvChoiceTable)
+	}
+
 	maxSignal := r.MaxSignal.Deserialize()
-	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v",
-		len(r.Candidates), len(r.NewInputs), maxSignal.Len())
+	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v groups=%v",
+	len(r.Candidates), len(r.NewInputs), maxSignal.Len(), len(changes))
 	fuzzer.addMaxSignal(maxSignal)
 	for _, inp := range r.NewInputs {
 		fuzzer.addInputFromAnotherFuzzer(inp)
@@ -428,7 +572,38 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 	if needCandidates && len(r.Candidates) == 0 && atomic.LoadUint32(&fuzzer.triagedCandidates) == 0 {
 		atomic.StoreUint32(&fuzzer.triagedCandidates, 1)
 	}
-	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0
+	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0 ||
+		len(changes) != 0
+}
+
+
+func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64, shouldBuildEvChoiceTable bool) bool {
+	a := &rpctype.PollArgs{
+		Name:           fuzzer.name,
+		NeedCandidates: needCandidates,
+		MaxSignal:      fuzzer.grabNewSignal().Serialize(),
+		MaxEvents:      fuzzer.grabNewEvents(),
+		Stats:          stats,
+	}
+	r := &rpctype.PollRes{}
+	if err := fuzzer.manager.Call("Manager.Poll", a, r); err != nil {
+		log.Fatalf("Manager.Poll call failed: %v", err)
+	}
+	maxSignal := r.MaxSignal.Deserialize()
+	log.Logf(1, "poll: candidates=%v inputs=%v signal=%v groups=%v",
+		len(r.Candidates), len(r.NewInputs), maxSignal.Len(), len(r.ChangedGroups))
+	fuzzer.addMaxSignal(maxSignal)
+	for _, inp := range r.NewInputs {
+		fuzzer.addInputFromAnotherFuzzer(inp)
+	}
+	for _, candidate := range r.Candidates {
+		fuzzer.addCandidateInput(candidate)
+	}
+	if needCandidates && len(r.Candidates) == 0 && atomic.LoadUint32(&fuzzer.triagedCandidates) == 0 {
+		atomic.StoreUint32(&fuzzer.triagedCandidates, 1)
+	}
+	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0 ||
+		len(r.ChangedGroups) != 0 || len(r.DeletedGroups) != 0
 }
 
 func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.Input) {
@@ -549,6 +724,21 @@ func (fuzzer *Fuzzer) addMaxSignal(sign signal.Signal) {
 	fuzzer.maxSignal.Merge(sign)
 }
 
+func (fuzzer *Fuzzer) grabNewEvents() [][]prog.EvtrackEvent {
+	fuzzer.eventsMu.Lock()
+	defer fuzzer.eventsMu.Unlock()
+	if len(fuzzer.batches) == 0 {
+		return nil
+	}
+	batch := fuzzer.batches[0]
+	if len(fuzzer.batches) == 1 {
+		fuzzer.batches = make([]prog.Batch, 0)
+	} else {
+		fuzzer.batches = fuzzer.batches[1:]
+	}
+	return batch.Events
+}
+
 func (fuzzer *Fuzzer) grabNewSignal() signal.Signal {
 	fuzzer.signalMu.Lock()
 	defer fuzzer.signalMu.Unlock()
@@ -564,6 +754,97 @@ func (fuzzer *Fuzzer) corpusSignalDiff(sign signal.Signal) signal.Signal {
 	fuzzer.signalMu.RLock()
 	defer fuzzer.signalMu.RUnlock()
 	return fuzzer.corpusSignal.Diff(sign)
+}
+
+func (fuzzer *Fuzzer) updateEvDropRate() {
+	progsTriggered := false
+	for true {
+		time.Sleep(time.Minute)
+
+		fuzzer.eventsMu.Lock()
+		evts := fuzzer.numEvents
+		fuzzer.numEvents = uint64(0)
+		numBatches := len(fuzzer.batches)
+		curDropRate := fuzzer.evDropRate
+		fuzzer.eventsMu.Unlock()
+		newDropRate := 0
+
+		if evts >= uint64(50000) {
+			newDropRate = int(((evts - uint64(50000)) * 100) / evts)
+		}
+		if numBatches > 100 {
+			if numBatches > 600 {
+				if newDropRate < 75 {
+					newDropRate = 75
+				}
+			} else {
+				if progsTriggered {
+					progsTriggered = false
+				} else {
+					newDropRate += 10
+					progsTriggered = true
+				}
+			}
+		}
+		if newDropRate == 0 {
+			if curDropRate > 10 {
+				newDropRate = curDropRate - 10
+			} else {
+				newDropRate = 0
+			}
+		}
+		if newDropRate >= 100 {
+			newDropRate = 90
+		}
+		fuzzer.eventsMu.Lock()
+		fuzzer.evDropRate = newDropRate
+		fuzzer.eventsMu.Unlock()
+	}
+}
+
+func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
+	fuzzer.eventsMu.Lock()
+	defer fuzzer.eventsMu.Unlock()
+	if rand.Intn(100) < fuzzer.evDropRate {
+		return
+	}
+	var curBatch prog.Batch
+	if len(fuzzer.batches) > 0 {
+		ind := len(fuzzer.batches) - 1
+		curBatch.Events = append(curBatch.Events, fuzzer.batches[ind].Events...)
+		curBatch.Size = fuzzer.batches[ind].Size
+	} else {
+		fuzzer.batches = append(fuzzer.batches, curBatch)
+	}
+	var flattened []prog.EvtrackEvent
+	for i, call := range info.Calls {
+		// To completely ignore events from the 14 banned syscalls, check for the name and continue here
+		name := p.Calls[i].Meta.Name
+		if _, ok := fuzzer.banned[name]; ok {
+			continue
+		}
+		for j := range call.EvList {
+			call.EvList[j].Syscall = p.Calls[i].Meta.Name
+			call.EvList[j].Args = make([]prog.Arg, len(p.Calls[i].Args))
+			copy(call.EvList[j].Args, p.Calls[i].Args)
+		}
+		flattened = append(flattened, call.EvList...)
+	}
+	curBatch.Events = append(curBatch.Events, flattened)
+	curBatch.Size += uint64(len(flattened))
+	fuzzer.numEvents += uint64(len(flattened))
+	fuzzer.batches[len(fuzzer.batches)-1] = curBatch
+	if curBatch.Size >= 2000 {
+		curBatch = *new(prog.Batch)
+		curBatch.Size = 0
+		curBatch.Events = make([][]prog.EvtrackEvent, 0)
+		fuzzer.batches = append(fuzzer.batches, curBatch)
+		select {
+		case fuzzer.hasBatch <- true:
+		default:
+			// the queue is already full, we don't need to add more to it
+		}
+	}
 }
 
 func (fuzzer *Fuzzer) checkNewSignal(p *prog.Prog, info *ipc.ProgInfo) (calls []int, extra bool) {

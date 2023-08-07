@@ -107,7 +107,7 @@ func TestVmaType(t *testing.T) {
 	r := newRand(target, rs)
 	pageSize := target.PageSize
 	for i := 0; i < iters; i++ {
-		s := newState(target, ct, nil)
+		s := newState(target, ct, nil, nil, nil)
 		calls := r.generateParticularCall(s, meta)
 		c := calls[len(calls)-1]
 		if c.Meta.Name != "test$vma0" {
@@ -237,13 +237,13 @@ func TestSpecialStructs(t *testing.T) {
 				if typ == nil {
 					t.Fatal("can't find struct description")
 				}
-				g := &Gen{newRand(target, rs), newState(target, ct, nil)}
+				g := &Gen{newRand(target, rs), newState(target, ct, nil, nil, nil)}
 				for i := 0; i < iters/len(target.SpecialTypes); i++ {
 					var arg Arg
 					for i := 0; i < 2; i++ {
 						arg, _ = gen(g, typ, DirInOut, arg)
-						if arg.Dir() != DirInOut {
-							t.Fatalf("got wrong arg dir %v", arg.Dir())
+						if arg.GetDir() != DirInOut {
+							t.Fatalf("got wrong arg dir %v", arg.GetDir())
 						}
 					}
 				}

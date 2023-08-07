@@ -22,6 +22,10 @@ const (
 	DefaultExecPerm = 0755
 )
 
+const (
+	ExitBailOut = 42
+)
+
 // RunCmd runs "bin args..." in dir with timeout and returns its output.
 func RunCmd(timeout time.Duration, dir, bin string, args ...string) ([]byte, error) {
 	cmd := Command(bin, args...)

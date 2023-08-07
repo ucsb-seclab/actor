@@ -82,7 +82,7 @@ func (p *Prog) MutateWithHints(callIndex int, comps CompMap, exec func(p *Prog))
 
 func generateHints(compMap CompMap, arg Arg, exec func()) {
 	typ := arg.Type()
-	if typ == nil || arg.Dir() == DirOut {
+	if typ == nil || arg.GetDir() == DirOut {
 		return
 	}
 	switch t := typ.(type) {

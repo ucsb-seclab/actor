@@ -5,15 +5,19 @@ package main
 
 import (
 	"bytes"
+	"encoding/gob"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +46,8 @@ var (
 	flagConfig = flag.String("config", "", "configuration file")
 	flagDebug  = flag.Bool("debug", false, "dump all VM output to console")
 	flagBench  = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagPprof  = flag.Bool("pprof", false, "enable pprof memory profiling, endpoint available at http://localhost:<syzMgrHttpPort>/debug/pprof")
+	flagProm  = flag.Bool("prom", false, "enable Prometheus, endpoint available at http://localhost:<syzMgrHttpPort>/metrics")
 )
 
 type Manager struct {
@@ -92,6 +98,8 @@ type Manager struct {
 	coverFilter        map[uint32]uint32
 	coverFilterBitmap  []byte
 	modulesInitialized bool
+
+	rpcserv *RPCServer
 }
 
 type CorpusItemUpdate struct {
@@ -144,7 +152,19 @@ func main() {
 	if prog.GitRevision == "" {
 		log.Fatalf("bad syz-manager build: build with make, run bin/syz-manager")
 	}
+
+	// geb requires registration of interface types
+	gob.RegisterName("github.com/google/syzkaller/prog.PointerArg", &prog.PointerArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.ResultArg", &prog.ResultArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.GroupArg", &prog.GroupArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.DataArg", &prog.DataArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.ConstArg", &prog.ConstArg{})
+	gob.RegisterName("github.com/google/syzkaller/prog.UnionArg", &prog.UnionArg{})
+
+
 	flag.Parse()
+	initMetrics()
+
 	log.EnableLogCaching(1000, 1<<20)
 	cfg, err := mgrconfig.LoadFile(*flagConfig)
 	if err != nil {
@@ -236,8 +256,19 @@ func RunManager(cfg *mgrconfig.Config) {
 			numReproducing := atomic.LoadUint32(&mgr.numReproducing)
 			numFuzzing := atomic.LoadUint32(&mgr.numFuzzing)
 
-			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v",
-				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
+			mgr.rpcserv.groupMu.Lock()
+			numNewGroups := len(mgr.rpcserv.newGroups)
+			merged := len(mgr.rpcserv.mergedGroups)
+			mgr.rpcserv.groupMu.Unlock()
+
+			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v" +
+				", groups %v (%v)",
+				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing,
+				merged, merged + numNewGroups)
+
+			if *flagProm {
+				numPendingGroups.Set(float64(merged + numNewGroups))
+			}
 		}
 	}()
 
@@ -315,6 +346,7 @@ func (mgr *Manager) vmLoop() {
 		instancesPerRepro = maxReproVMs
 	}
 	instances := SequentialResourcePool(vmCount, 10*time.Second*mgr.cfg.Timeouts.Scale)
+	var deadInstances []int
 	runDone := make(chan *RunResult, 1)
 	pendingRepro := make(map[*Crash]bool)
 	reproducing := make(map[string]bool)
@@ -322,7 +354,7 @@ func (mgr *Manager) vmLoop() {
 	reproDone := make(chan *ReproResult, 1)
 	stopPending := false
 	shutdown := vm.Shutdown
-	for shutdown != nil || instances.Len() != vmCount {
+	for shutdown != nil || instances.Len() + len(deadInstances) != vmCount {
 		mgr.mu.Lock()
 		phase := mgr.phase
 		mgr.mu.Unlock()
@@ -396,10 +428,24 @@ func (mgr *Manager) vmLoop() {
 				log.Logf(0, "%v", res.err)
 			}
 			stopPending = false
-			instances.Put(res.idx)
+			// Don/t restart the fuzzer instance if the
+			// fuzzer bailed out voluntarily (ExitBailOut)
+			crash := res.crash
+			reportType := report.Unknown
+			if crash != nil {
+				reportType = crash.Report.Type
+				if reportType == report.BailOut {
+					deadInstances = append(deadInstances, res.idx)
+				} else {
+					instances.Put(res.idx)
+				}
+			} else {
+				instances.Put(res.idx)
+			}
 			// On shutdown qemu crashes with "qemu: terminating on signal 2",
 			// which we detect as "lost connection". Don't save that as crash.
-			if shutdown != nil && res.crash != nil {
+			// BailOut crashes aren't true crashes, they don;t need a repro.
+			if shutdown != nil && res.crash != nil && reportType != report.BailOut {
 				needRepro := mgr.saveCrash(res.crash)
 				if needRepro {
 					log.Logf(1, "loop: add pending repro for '%v'", res.crash.Title)
@@ -445,6 +491,99 @@ func (mgr *Manager) vmLoop() {
 			reply <- repros
 			goto wait
 		}
+	}
+	mgr.dumpEvtrackEvents()
+}
+
+func (mgr *Manager) loadCfg() map[string]string {
+	cfg := map[string]string{}
+	vmCfg := &map[string]interface{}{}
+	err := json.Unmarshal(mgr.cfg.VM, vmCfg); if err != nil {
+		log.Fatalf("Failed to unmarshal vm config: %v", err)
+	}
+	cfg["compressedKernel"] = osutil.Abs((*vmCfg)["kernel"].(string))
+	cfg["kernelDir"] = strings.Replace(cfg["compressedKernel"], "/arch/x86/boot/bzImage", "", 1)
+	// Check if kernel directory exists
+	if _, err := os.Stat(cfg["kernelDir"]); errors.Is(err, fs.ErrNotExist) {
+		log.Fatalf("Kernel directory '%v' does not exist", cfg["kernelDir"])
+	}
+	cfg["uncompressedKernel"] = filepath.Join(cfg["kernelDir"], "vmlinux")
+	// Check if uncompressed kernel exists
+	if _, err := os.Stat(cfg["uncompressedKernel"]); errors.Is(err, fs.ErrNotExist) {
+		log.Fatalf("Uncompressed kernel '%v' does not exist", cfg["uncompressedKernel"])
+	}
+	cfg["workdir"] = mgr.cfg.Workdir
+	return cfg
+}
+
+func (mgr *Manager) dumpEvtrackEvents() {
+	fmt.Println("Wait for still running minimization")
+	mgr.rpcserv.groupMin <- 1
+	<-mgr.rpcserv.groupMin
+	fmt.Println("Waiting done")
+	mgr.rpcserv.minimize()
+	fmt.Println("Minimization done")
+
+	var filename = mgr.crashdir + "/evtrackgroups.dmp"
+	f, err := os.Create(filename)
+	if err != nil {
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	defer f.Close()
+
+	buf := new(bytes.Buffer)
+	enc := gob.NewEncoder(buf)
+	err = enc.Encode(append(mgr.rpcserv.newGroups, mgr.rpcserv.mergedGroups...))
+	if err != nil {
+		fmt.Println(err)
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	f.Write(buf.Bytes())
+
+	mgr.rpcserv.cacheMu.Lock()
+	defer mgr.rpcserv.cacheMu.Unlock()
+	filename = mgr.crashdir + "/cache.dmp"
+	f1, err := os.Create(filename)
+	if err != nil {
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	defer f1.Close()
+	buf = new(bytes.Buffer)
+	enc = gob.NewEncoder(buf)
+	fmt.Println("Size of cache:", len(mgr.rpcserv.subsysCache))
+	err = enc.Encode(mgr.rpcserv.subsysCache)
+	if err != nil {
+		fmt.Println(err)
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	f1.Write(buf.Bytes())
+
+	filename = mgr.crashdir + "/api_cache.dmp"
+	f2, err := os.Create(filename)
+	if err != nil {
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	defer f2.Close()
+	buf = new(bytes.Buffer)
+	enc = gob.NewEncoder(buf)
+	fmt.Println("Size of api cache:", len(mgr.rpcserv.apiCache))
+	err = enc.Encode(mgr.rpcserv.apiCache)
+	if err != nil {
+		fmt.Println(err)
+		log.Logf(0, "some error in dumpEvtrackEvents\n")
+		return
+	}
+	f2.Write(buf.Bytes())
+
+	fmt.Println("Shared objects:", mgr.rpcserv.shared_objects)
+	fmt.Println("Shared accesses:", mgr.rpcserv.shared_accesses)
+	for subsys, val := range mgr.rpcserv.shared_acc_subsys {
+		fmt.Println("Shared accesses in", subsys, ":", val)
 	}
 }
 
@@ -770,6 +909,8 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Re
 		Procs:     procs,
 		Verbosity: fuzzerV,
 		Cover:     mgr.cfg.Cover,
+		Event:     mgr.cfg.Event,
+		Vanilla:   mgr.cfg.Vanilla,
 		Debug:     *flagDebug,
 		Test:      false,
 		Runtest:   false,

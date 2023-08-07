@@ -126,7 +126,8 @@ var (
 	Shutdown   = make(chan struct{})
 	ErrTimeout = errors.New("timeout")
 
-	Types = make(map[string]Type)
+	ErrBailOut = errors.New("bailout")
+	Types      = make(map[string]Type)
 )
 
 func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout time.Duration,
@@ -153,10 +154,20 @@ func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout t
 			cmd.Process.Kill()
 			console.Close()
 			merger.Wait()
-			if cmdErr := cmd.Wait(); cmdErr == nil {
+			cmdErr := cmd.Wait()
+			if cmdErr == nil {
 				// If the command exited successfully, we got EOF error from merger.
 				// But in this case no error has happened and the EOF is expected.
 				err = nil
+			} else {
+				// Did the fuzzer voluntarily bail out? (ExitBailOut)
+				if exitError, ok := cmdErr.(*exec.ExitError); ok {
+					exitCode := exitError.ExitCode()
+					log.Logf(0, "fuzzer exited with code %d\n", exitCode)
+					if exitCode == osutil.ExitBailOut {
+						err = ErrBailOut
+					}
+				}
 			}
 			signal(err)
 			return

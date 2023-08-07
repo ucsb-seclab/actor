@@ -11,7 +11,34 @@ import (
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
+	"github.com/google/syzkaller/prog"
 )
+
+type GetStratArg struct {
+	Name string
+}
+
+type GetStratRes struct {
+	Len uint64
+}
+
+type PollArgsNew struct {
+	Name           string
+	NeedCandidates bool
+	MaxSignal      signal.Serial
+	Stats          map[string]uint64
+	NewUsed        map[uint64]bool
+	EvtLen         uint64
+	DeletedIDs     []uint64
+}
+
+type PollResNew struct {
+	Candidates    []Candidate
+	NewInputs     []Input
+	MaxSignal     signal.Serial
+	ChangeLen     uint64
+	DeletedLen    uint64
+}
 
 type Input struct {
 	Call     string
@@ -73,13 +100,16 @@ type PollArgs struct {
 	Name           string
 	NeedCandidates bool
 	MaxSignal      signal.Serial
+	MaxEvents      [][]prog.EvtrackEvent
 	Stats          map[string]uint64
 }
 
 type PollRes struct {
-	Candidates []Candidate
-	NewInputs  []Input
-	MaxSignal  signal.Serial
+	Candidates    []Candidate
+	NewInputs     []Input
+	MaxSignal     signal.Serial
+	ChangedGroups []*prog.Group
+	DeletedGroups []uint64
 }
 
 type RunnerConnectArgs struct {
