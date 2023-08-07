@@ -5,7 +5,7 @@ Instead of focusing on code coverage optimization, our approach generates fuzzer
 Specifically, we first capture actions that potentially operate on shared data structures at different times.
 Then, we synthesize programs using those actions as building blocks, guided by bug templates expressed in our domain-specific language.
 
-For more details, please refer to our [paper](https://seclab.cs.ucsb.edu/publications/fleischer_actor_23/).
+For more details, please refer to our [paper](https://www.usenix.org/conference/usenixsecurity23/presentation/fleischer).
 This repo contains all necessary sources and instructions to setup and run ACTOR.
 
 ## Setup
