@@ -1,0 +1,1304 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index c84d12608cd2..7d2dc3751a92 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -417,3 +417,8 @@
+ 547	x32	pwritev2		compat_sys_pwritev64v2
+ # This is the end of the legacy x32 range.  Numbers 548 and above are
+ # not special and are not to be used for x32-specific syscalls.
++
++548>---64>-----mycall>->------->-------sys_mycall
++549>---64>-----mycall2>>------->-------sys_mycall2
++550>---64>-----mycall3>>------->-------sys_mycall3
++
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index 96d51bbc2bd4..83f37f8eb0ae 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -25,6 +25,10 @@ KASAN_SANITIZE_dumpstack_$(BITS).o			:= n
+ KASAN_SANITIZE_stacktrace.o				:= n
+ KASAN_SANITIZE_paravirt.o				:= n
+ KASAN_SANITIZE_sev.o					:= n
++# Prevents double fault generated due to inducing
++# # a second page fault while serving the first
++KASAN_SANITIZE_traps.o					:= n
++
+ 
+ # With some compiler versions the generated code results in boot hangs, caused
+ # by several compilation units. To be safe, disable all instrumentation.
+diff --git a/arch/x86/kernel/cpu/Makefile b/arch/x86/kernel/cpu/Makefile
+index d7e3ceaf75c1..96701c1e6f43 100644
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@ -13,6 +13,25 @@ endif
+ KCOV_INSTRUMENT_common.o := n
+ KCOV_INSTRUMENT_perf_event.o := n
+ KMSAN_SANITIZE_common.o := n
++# If this file is instrumented, it causes a boot-loop.
++# Normally, KASAN sanitizing this file wouldn't be an issue.
++# However, we hijack KASAN hooks to inject EVTRACK instrumentation.
++# When the crash takes place, the call stack looks like this:
++#
++#   0xffffffff84391d37 <setup_per_cpu_areas+754>    call   switch_to_new_gdt
++#   0xffffffff81058734 <switch_to_new_gdt+132>      call   load_percpu_segment
++#   0xffffffff81058678 <load_percpu_segment+24>     call   __asan_load8_noabort·
++#   0xffffffff813d3c63 <__asan_load8_noabort+51>    call   record_event
++#
++#   0xffffffff8124d400 <record_event>        push   r15
++#   0xffffffff8124d402 <record_event+2>      push   r14
++# ► 0xffffffff8124d404 <record_event+4>      mov    eax, dword ptr gs:[rip + 0x7edd3afd]		# 0x20f08 <__preempt_count>
++# The memory access at the `mov` instruction causes a panic.
++# In Linux x86-64, `gs` register is used to access per-cpu variables.
++# The panic occurrs when the EVTRACK trampoline attemps to access `__preempt_count`.
++# We exclude `common.o` from KASAN sanitization just to avoid
++# instrumenting the `load_percpu_segment()` method.
++KASAN_SANITIZE_common.o := n
+ 
+ # As above, instrumenting secondary CPU boot code causes boot hangs.
+ KCSAN_SANITIZE_common.o := n
+diff --git a/arch/x86/mm/Makefile b/arch/x86/mm/Makefile
+index c80febc44cd2..a67f49e75af4 100644
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@ -10,6 +10,10 @@ KASAN_SANITIZE_mem_encrypt.o		:= n
+ KASAN_SANITIZE_mem_encrypt_amd.o	:= n
+ KASAN_SANITIZE_mem_encrypt_identity.o	:= n
+ KASAN_SANITIZE_pgprot.o		:= n
++# Prevents double fault generated due to inducing
++# a second page fault while serving the first
++KASAN_SANITIZE_fault.o		:= n
++
+ 
+ # Disable KCSAN entirely, because otherwise we get warnings that some functions
+ # reference __initdata sections.
+diff --git a/include/linux/evtrack.h b/include/linux/evtrack.h
+new file mode 100644
+index 000000000000..e900e3d75abd
+--- /dev/null
++++ b/include/linux/evtrack.h
+@@ -0,0 +1,70 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_EVTRACK_H
++#define _LINUX_EVTRACK_H
++
++#include <uapi/linux/evtrack.h>
++
++struct task_struct;
++
++#ifdef CONFIG_EVTRACK
++
++enum evtrack_mode {
++	/* Coverage collection is not enabled yet. */
++	EVTRACK_MODE_DISABLED = 0,
++	/* EVTRACK was initialized, but tracing mode hasn't been chosen yet. */
++	EVTRACK_MODE_INIT = 1,
++	/* Track all the allocations */
++	EVTRACK_MODE_TRACK_ALL = 2,
++	/* Temporarily stop event tracing */
++	EVTRACK_MODE_STOP = 3
++};
++
++/*
++ * evtrack descriptor (one per opened debugfs file).
++ * State transitions of the descriptor:
++ *  - initial state after open()
++ *  - then there must be a single ioctl(EVTRACK_INIT_TRACE) call
++ *  - then, mmap() call (several calls are allowed but not useful)
++ *  - then, ioctl(EVTRACK_ENABLE, arg), where arg is
++ *  - then, ioctl(EVTRACK_DISABLE) to disable the task.
++ * Enabling/disabling ioctls can be repeated (only one task a time allowed).
++ */
++struct evtrack {
++    /*
++     * Reference counter. We keep one for:
++     *  - opened file descriptor
++     *  - task with enabled event tracking (we can't unwire it from another task)
++     */
++    refcount_t		refcount;
++    /* The lock protects mode, nr_events, area and t. */
++    spinlock_t		lock;
++    enum evtrack_mode		mode;
++    /* Number of events to be recorded. */
++    unsigned int		nr_events;
++    /* Coverage buffer shared with user space. */
++    void			*area;
++    /* Task for which we collect event, or NULL. */
++    struct task_struct	*t;
++    /* RB-tree root for storing seen allocations. */
++    struct rb_root root;
++    /* Timestamp of first event recorded during this system call */
++    __u64 timestamp;
++};
++
++struct api {
++    char name[256];
++    unsigned long start, size;
++};
++
++void evtrack_task_init(struct task_struct *t);
++void evtrack_task_exit(struct task_struct *t);
++void record_event(enum evtrack_event_types event_type, const void* ptr, size_t size, bool keep_tag);
++
++#else
++
++static inline void evtrack_task_init(struct task_struct *t) {}
++static inline void evtrack_task_exit(struct task_struct *t) {}
++static void record_event(enum evtrack_event_types event_type, const void* ptr, size_t size, bool keep_tag) {}
++
++#endif /* CONFIG_EVTRACK */
++#endif /* _LINUX_EVTRACK_H */
+diff --git a/include/linux/mycall.h b/include/linux/mycall.h
+new file mode 100644
+index 000000000000..3fb4cf1ddf8c
+--- /dev/null
++++ b/include/linux/mycall.h
+@@ -0,0 +1,3 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++char *get_my_pointer(void);
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 853d08f7562b..78f6cc7e2585 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1423,6 +1423,21 @@ struct task_struct {
+ 	unsigned int			kcov_softirq;
+ #endif
+ 
++#ifdef CONFIG_EVTRACK
++	/* Event tracking enabled for this task (0 if disabled): */
++	unsigned int			evtrack_mode;
++
++	/* Size of the evtrack_area: */
++	unsigned int			evtrack_size;
++
++	/* Buffer for event tracking: */
++	void				*evtrack_area;
++
++	/* EVTRACK descriptor wired with this task or NULL: */
++	struct evtrack			*evtrack;
++#endif
++
++
+ #ifdef CONFIG_MEMCG
+ 	struct mem_cgroup		*memcg_in_oom;
+ 	gfp_t				memcg_oom_gfp_mask;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 33a0ee3bcb2e..dfa4028015fa 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -1361,6 +1361,10 @@ static inline unsigned int ksys_personality(unsigned int personality)
+ 	return old;
+ }
+ 
++asmlinkage long sys_mycall(void);
++asmlinkage long sys_mycall2(void);
++asmlinkage long sys_mycall3(void);
++
+ /* for __ARCH_WANT_SYS_IPC */
+ long ksys_semtimedop(int semid, struct sembuf __user *tsops,
+ 		     unsigned int nsops,
+diff --git a/include/uapi/linux/evtrack.h b/include/uapi/linux/evtrack.h
+new file mode 100644
+index 000000000000..bed76291ab98
+--- /dev/null
++++ b/include/uapi/linux/evtrack.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _LINUX_EVTRACK_IOCTLS_H
++#define _LINUX_EVTRACK_IOCTLS_H
++
++#include <linux/types.h>
++#include <linux/rbtree.h>
++#include <linux/atomic.h>
++
++#define EVTRACK_INIT_TRACK                     _IOR('c', 1, unsigned long)
++#define EVTRACK_ENABLE                     _IO('c', 100)
++#define EVTRACK_DISABLE                            _IO('c', 101)
++#define EVTRACK_DEBUG                      _IO('c', 102)
++#define EVTRACK_STOP                       _IO('c', 103)
++
++/* Maximum number of stack trace entries in the context stored */
++#define NR_MAX_TRACE_ENTRIES        32
++
++enum {
++       /* Track all the allocations */
++       EVTRACK_TRACK_ALL = 0
++};
++
++enum evtrack_event_types {
++       /* Heap allocations, e.g. kmalloc() */
++       EVTRACK_EVENT_HEAP_ALLOCATION = 1,
++
++       /* Heap deallocations, e.g. kfree() */
++       EVTRACK_EVENT_HEAP_DEALLOCATION = 2,
++
++       /* Reading from heap buffer */
++       EVTRACK_EVENT_HEAP_READ = 3,
++
++       /* Writing to heap buffer */
++       EVTRACK_EVENT_HEAP_WRITE = 4
++};
++
++struct evtrack_event {
++       unsigned int event_id;                    // Monotonically increasing event id
++       enum evtrack_event_types type;    // Type of the event
++       const void* ptr;                  // Pointer associated to the event
++       size_t size;                      // Size associated to the event
++       unsigned int nr_trace;                    // Number of entries in the stack trace
++       /*
++        * Ref: http://static.lwn.net/images/pdf/LDD3/ch11.pdf
++        * If a user-space program needs to use these types, it can prefix the names
++        * with a double underscore: __u8 and the other types are defined independent
++        * of __KERNEL__. If, for example, a driver needs to exchange binary structures
++        * with a program running in user space by means of ioctl, the header files
++        * should declare 32-bit fields in the structures as __u32.
++        */
++       __u64 timestamp;                                // Monotonically increasing pseudo timestamp
++       unsigned int obj_id     ;                       // The event_id of the object this event is related to
++       unsigned long instr_id;                         // The id of the instruction that triggers this event, e.g., calls kfree
++       unsigned long trace[NR_MAX_TRACE_ENTRIES];      // Stack-trace leading to the event, starting at the syscall
++};
++
++struct ev_rbtree_node {
++       struct rb_node node;    // rb_tree node for the rb_tree interface
++       char *ptr;              // Pointer of the allocation, also used as key for sorting
++       size_t size;            // size of allocation
++       atomic64_t r_timestamp; // timestamp of the most recently recorded read
++       atomic64_t w_timestamp; // timestamp of the most recently recorded write
++};
++
++#endif /* _LINUX_EVTRACK_IOCTLS_H */
++
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 10ef068f598d..6f57f6d2d028 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -38,6 +38,11 @@ KCOV_INSTRUMENT_kcov.o := n
+ KASAN_SANITIZE_kcov.o := n
+ KCSAN_SANITIZE_kcov.o := n
+ UBSAN_SANITIZE_kcov.o := n
++# If EVTRACK is self-instrumented, the instrumentation
++# generates infinite recursive calls to itself -- which
++# makes booting fail at an early stage.
++KCOV_INSTRUMENT_evtrack.o := n
++KASAN_SANITIZE_evtrack.o := n
+ KMSAN_SANITIZE_kcov.o := n
+ CFLAGS_kcov.o := $(call cc-option, -fno-conserve-stack) -fno-stack-protector
+ 
+@@ -86,6 +91,11 @@ obj-$(CONFIG_AUDIT) += audit.o auditfilter.o
+ obj-$(CONFIG_AUDITSYSCALL) += auditsc.o audit_watch.o audit_fsnotify.o audit_tree.o
+ obj-$(CONFIG_GCOV_KERNEL) += gcov/
+ obj-$(CONFIG_KCOV) += kcov.o
++obj-$(CONFIG_EVTRACK) += evtrack.o
++CFLAGS_evtrack.o := -DDEBUG
++obj-y += my_syscall.o
++obj-y += my_syscall2.o
++obj-y += my_syscall3.o
+ obj-$(CONFIG_KPROBES) += kprobes.o
+ obj-$(CONFIG_FAIL_FUNCTION) += fail_function.o
+ obj-$(CONFIG_KGDB) += debug/
+diff --git a/kernel/evtrack.c b/kernel/evtrack.c
+new file mode 100644
+index 000000000000..e291d68e18cc
+--- /dev/null
++++ b/kernel/evtrack.c
+@@ -0,0 +1,717 @@
++// SPDX-License-Identifier: GPL-2.0
++#define pr_fmt(fmt) "evtrack: " fmt
++
++#include <linux/compiler.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/types.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/hashtable.h>
++#include <linux/init.h>
++#include <linux/mm.h>
++#include <linux/preempt.h>
++#include <linux/printk.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/vmalloc.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/evtrack.h>
++#include <linux/refcount.h>
++#include <linux/log2.h>
++#include <asm/setup.h>
++#include <linux/stacktrace.h>
++#include <linux/stackdepot.h>
++#include <linux/string.h>
++#include <linux/kallsyms.h>
++#include <linux/atomic.h>
++
++#define evtrack_debug(fmt, ...) pr_debug("%s: " fmt, __func__, ##__VA_ARGS__)
++
++/* Globals */
++static atomic64_t timestamp = ATOMIC64_INIT(0);
++static char *api_names[] = {"__kasan_kmalloc", "kmem_cache_alloc_trace",
++	"kfree", "slab_post_alloc_hook", "kmalloc_array", "kcalloc",
++	"kzalloc", "kmalloc", "slab_free_freelist_hook", "__kasan_slab_free",
++	"__vmalloc_node", "__asan_load1", "__asan_load2", "__asan_load4",
++	"__asan_load8", "__asan_store1", "__asan_store2", "__asan_store4",
++	"__asan_store8", "kmem_cache_free", "__kmalloc",
++	"kmem_cache_alloc_node", "__kmalloc_track_caller", "kvmalloc_node",
++	"kmalloc_node", "__vmalloc_node_range", "__kmalloc_node",
++	"kmem_cache_alloc_node_trace", "kvfree", "check_memory_region",
++	"kmem_cache_alloc"};
++//
++struct api* api_details;
++
++/* debugfs */
++bool noconsole = true, noshmem = false;
++unsigned long evcnt = 0, max_evcnt = -1;
++unsigned long long evtypes = ((1 << EVTRACK_EVENT_HEAP_ALLOCATION) | (1 << EVTRACK_EVENT_HEAP_DEALLOCATION) |
++							 (1 << EVTRACK_EVENT_HEAP_READ) | (1 << EVTRACK_EVENT_HEAP_WRITE)) >> 1;
++
++static bool check_evtrack_mode(enum evtrack_mode needed_mode, struct task_struct *t)
++{
++	unsigned int mode;
++
++	/*
++	 * We are interested in event tracking as a function of a syscall inputs,
++	 * so we ignore code executed in interrupts.
++	 */
++	if (!in_task())
++		return false;
++	if (rcu_preempt_depth())
++		return false;
++	if (in_softirq())
++		return false;
++	if (in_serving_softirq())
++		return false;
++	if (in_hardirq())
++		return false;
++	if (in_irq())
++		return false;
++	if (in_atomic())
++		return false;
++	if (irqs_disabled())
++		return false;
++
++	mode = READ_ONCE(t->evtrack_mode);
++	/*
++	 * There is some code that runs in interrupts but for which
++	 * in_interrupt() returns false (e.g. preempt_schedule_irq()).
++	 * READ_ONCE()/barrier() effectively provides load-acquire wrt
++	 * interrupts, there are paired barrier()/WRITE_ONCE() in
++	 * evtrack_start().
++	 */
++	barrier();
++	return mode == needed_mode;
++}
++
++/*
++ * Return true if an event takes place on an object which we
++ * have observed getting allocated. Return False otherwise.
++ */
++static bool is_known_allocation(struct evtrack_event* event, struct rb_root* root, __u64 ts_old) {
++	struct rb_node *node = root->rb_node;
++	struct ev_rbtree_node *data;
++	char *ptr = (char *) event->ptr;
++	char *alloc_ptr;
++	size_t alloc_size;
++	__u64 tmp, old;
++
++	while (node) {
++		data = rb_entry(node, struct ev_rbtree_node, node);
++		alloc_ptr = data->ptr;
++		alloc_size = data->size;
++		if (ptr < alloc_ptr)
++			node = node->rb_left;
++		else if (ptr >= (alloc_ptr + alloc_size))
++			node = node->rb_right;
++		else {
++			if (event->type == EVTRACK_EVENT_HEAP_READ) {
++				old = (__u64) atomic64_read(&data->r_timestamp);
++				if (ts_old > old || old == 0) {
++					smp_mb__before_atomic();
++					tmp = (__u64) atomic64_cmpxchg(&data->r_timestamp, old, atomic64_read(&timestamp));
++					smp_mb__after_atomic();
++					if (tmp == old) {
++						return true;
++					} else {
++						return false;
++					}
++				} else {
++					return false;
++				}
++				/*
++				if (ts_old > data->r_timestamp || data->r_timestamp == 0) {
++					// this time stamp may not be exactly the one the event will have later on
++					// because another event in a different thread could get this timestamp.
++					// This is not a problem since we will still detect that there has been
++					// a read for this object.
++					data->r_timestamp = atomic64_read(&timestamp);
++					return true;
++				} else {
++					return false;
++				}
++				*/
++			}
++			if (event->type == EVTRACK_EVENT_HEAP_WRITE) {
++				old = (__u64) atomic64_read(&data->w_timestamp);
++				if (ts_old > old || old == 0) {
++					smp_mb__before_atomic();
++					tmp = (__u64) atomic64_cmpxchg(&data->w_timestamp, old, atomic64_read(&timestamp));
++					smp_mb__after_atomic();
++					if (tmp == old) {
++						return true;
++					} else {
++						return false;
++					}
++				} else {
++					return false;
++				}
++				/*
++				if (ts_old > data->w_timestamp || data->w_timestamp == 0) {
++					data->r_timestamp = atomic64_read(&timestamp);
++					return true;
++				} else {
++					return false;
++				}
++				*/
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/*
++ * Save the allocation in the red-black tree so that we can
++ * search for it later.
++ */
++static void save_allocation(struct evtrack_event* event, struct rb_root* root) {
++	struct ev_rbtree_node *this;
++	struct rb_node **new = &(root->rb_node), *parent = NULL;
++	struct ev_rbtree_node *data = kzalloc(sizeof(struct ev_rbtree_node),
++			GFP_KERNEL);
++	if (data == NULL)
++		return;
++	data->ptr = (char *) event->ptr;
++	data->size = event->size;
++	data->r_timestamp = (atomic64_t) ATOMIC64_INIT(0);
++	data->w_timestamp = (atomic64_t) ATOMIC64_INIT(0);
++
++	/* Figure out where to put new node. */
++	while(*new) {
++		this = rb_entry(*new, struct ev_rbtree_node, node);
++		parent = *new;
++		if (this->ptr > data->ptr)
++			new = &((*new)->rb_left);
++		else if ((this->ptr + this->size) <= data->ptr)
++			new = &((*new)->rb_right);
++		else {
++			if (data->size > this->size)
++				this->size = data->size;
++			kfree(data);
++			return;
++		}
++	}
++
++	/*Add new node and rebalance tree. */
++	rb_link_node(&data->node, parent, new);
++	rb_insert_color(&data->node, root);
++}
++
++/*
++* Identify the instruction that has triggered this event.
++*/
++/*
++static void identify_trigger(struct evtrack_event* event) {
++	unsigned int trace_idx, api_idx, num_api_methods;
++	unsigned long trace_addr;
++	bool is_found, is_not_found;
++	struct api* api_info;
++
++	event->instr_id = 0;
++	is_found = false;
++	num_api_methods = sizeof(api_names) / sizeof(api_names[0]);
++	// Iterate over the call-stack
++	for (trace_idx = 0; trace_idx < event->nr_trace; trace_idx++) {
++		trace_addr = event->trace[trace_idx];
++		is_not_found = true;
++		// Check if a call-stack entry belongs to the
++		// list of kernel API associated with the event
++		for (api_idx = 0; api_idx < num_api_methods; api_idx++) {
++			api_info = api_details + api_idx;
++			if ((trace_addr >= api_info->start) && (trace_addr < (api_info->start + api_info->size))) {
++				is_found = true;
++				is_not_found = false;
++				break;
++			}
++		}
++
++		if (is_found && is_not_found) {
++			event->instr_id = trace_addr;
++			is_found = false;
++		}
++	}
++}
++*/
++
++/*
++* Saves the stack-trace of the event, and filters out a trace
++* if it is IRQ generated. In fact, it returns the depth of the
++* stack-trace until the IRQ caller. If an IRQ caller exists,
++* the returned depth will be smaller than the actual depth.
++*/
++static unsigned int save_stack_trace(struct evtrack_event* event) {
++	unsigned int nr_trace, nr_filtered_trace;
++
++	nr_trace = stack_trace_save(event->trace, NR_MAX_TRACE_ENTRIES, 0);
++	event->nr_trace = nr_trace;
++	nr_filtered_trace = filter_irq_stacks(event->trace, nr_trace);
++	return nr_filtered_trace;
++}
++
++/*
++* Filter out types of events not being tracked.
++* Specific event types can be enabled or disabled
++* by writing to /sys/kernel/debug/ev/evcnt/evtypes
++* debugfs file.
++*/
++
++void record_event(enum evtrack_event_types event_type, const void* ptr,
++                    size_t size, bool keep_tag) {
++	struct task_struct *t;
++	struct evtrack_event *events, *event;
++	unsigned int evtrack_size, nr_filtered_trace;
++	unsigned long nr_events;
++
++	/*
++	 * We are interested in event tracking as a function of a syscall inputs,
++	 * so we ignore code executed in interrupts.
++	 */
++	t = current;
++	if (!check_evtrack_mode(EVTRACK_MODE_TRACK_ALL, t)) {
++		return;
++	}
++
++	/*
++	 * We must disable EVTRACK here to avoid recursive calls
++	 * from the instrumented kernel APIs that we use below.
++	 * Recursive EVTRACK calls from inside the APIs not only
++	 * generate irrelevant events, but also blows up the kernel
++	 * stack. The root cause of the issue is hard to pin down,
++	 * as it is manifested in many forms, e.g., deadlock, memory
++	 * corruptions, etc., with varying contexts in different executions.
++	 */
++	WRITE_ONCE(t->evtrack_mode, EVTRACK_MODE_DISABLED);
++
++	events = (struct evtrack_event*)t->evtrack_area;
++	event = events;
++	/* The size field of the first entry contains the number of events recorded. */
++	nr_events = READ_ONCE(events->size) + 1;
++	evtrack_size = nr_events * sizeof(struct evtrack_event);
++	if (likely(evtrack_size < t->evtrack_size)) {
++		event += nr_events;
++
++		// Filter the event out if it is not of a type being tracked
++		if (!(evtypes & (1ul << (event_type - 1))))
++			goto out;
++
++		// Filter out a READ/WRITE event if the allocation hasn't been seen before
++		event->ptr = ptr;
++		event->instr_id = 0;
++		event->type = event_type;
++		if (event_type == EVTRACK_EVENT_HEAP_READ
++				|| event_type == EVTRACK_EVENT_HEAP_WRITE
++				|| event_type == EVTRACK_EVENT_HEAP_DEALLOCATION) {
++			if (!is_known_allocation(event, &(t->evtrack->root), t->evtrack->timestamp))
++				goto out;
++		} else {
++			// insert event into rb tree
++			save_allocation(event, &(t->evtrack->root));
++			event->obj_id = 0;				// EVTRACK_EVENT_HEAP_ALLOCATION
++		}
++
++		// Filter out an event if generated by an IRQ caller
++		nr_filtered_trace = save_stack_trace(event);
++		if (nr_filtered_trace < event->nr_trace)
++			goto out;
++		evcnt += 1;
++		event->event_id = nr_events;
++		event->size = size;
++		//event->type = event_type;
++		// event->timestamp = ktime_get_ns();
++		event->timestamp = (__u64) atomic64_inc_return(&timestamp) - 1;
++		//event->timestamp = ++timestamp;		// A monotonically increasing pseudo timestamp
++
++		// Identify the instruction that has triggered this event
++		//identify_trigger(event);
++
++		if (!noshmem)
++			WRITE_ONCE(events->size, nr_events);
++
++	}
++
++	if (evcnt >= max_evcnt)
++		return;
++
++out:
++	// Re-enable EVTRACK that we disabled above (in the beginning)
++	WRITE_ONCE(t->evtrack_mode, EVTRACK_MODE_TRACK_ALL);
++}
++
++static void evtrack_start(struct task_struct *t, unsigned int size,
++		void *area, enum evtrack_mode mode)
++{
++	evtrack_debug("t=%px, size=%u, area=%px\n", t, size, area);
++	/* Cache in task struct for performance. */
++	t->evtrack_size = size;
++	t->evtrack_area = area;
++	/* See comment in check_evtrack_mode(). */
++	barrier();
++	WRITE_ONCE(t->evtrack_mode, mode);
++}
++
++static void evtrack_restart(struct task_struct *t, struct evtrack *evtrack)
++{
++	WRITE_ONCE(t->evtrack_mode, EVTRACK_MODE_TRACK_ALL);
++	barrier();
++	evtrack->mode = EVTRACK_MODE_TRACK_ALL;
++}
++
++static void evtrack_stop(struct task_struct *t, struct evtrack *evtrack)
++{
++	WRITE_ONCE(t->evtrack_mode, EVTRACK_MODE_STOP);
++	barrier();
++	evtrack->mode = EVTRACK_MODE_STOP;
++}
++
++static void evtrack_task_reset(struct task_struct *t)
++{
++	WRITE_ONCE(t->evtrack_mode, EVTRACK_MODE_DISABLED);
++	barrier();
++	t->evtrack_size = 0;
++	t->evtrack_area = NULL;
++	t->evtrack = NULL;
++}
++
++void evtrack_task_init(struct task_struct *t)
++{
++	evtrack_task_reset(t);
++}
++
++static void evtrack_reset(struct evtrack *evtrack)
++{
++	evtrack->t = NULL;
++	evtrack->mode = EVTRACK_MODE_INIT;
++}
++
++static void evtrack_disable(struct task_struct *t, struct evtrack *evtrack)
++{
++	evtrack_task_reset(t);
++	evtrack_reset(evtrack);
++}
++
++static void evtrack_get(struct evtrack *evtrack)
++{
++	refcount_inc(&evtrack->refcount);
++}
++
++static void free_rb_tree_node(struct rb_node *node) {
++	struct ev_rbtree_node *data;
++	if (!node)
++		return;
++	if (node->rb_right)
++		free_rb_tree_node(node->rb_right);
++	if (node->rb_left)
++		free_rb_tree_node(node->rb_left);
++	data = rb_entry(node, struct ev_rbtree_node, node);
++	kfree(data);
++}
++
++static void free_rb_tree(struct evtrack *evtrack) {
++	struct rb_root *root = &(evtrack->root);
++	free_rb_tree_node(root->rb_node);
++	root->rb_node = NULL;
++}
++
++static void evtrack_put(struct evtrack *evtrack)
++{
++	if (refcount_dec_and_test(&evtrack->refcount)) {
++		vfree(evtrack->area);
++		free_rb_tree(evtrack);
++		kfree(evtrack);
++	}
++}
++
++void evtrack_task_exit(struct task_struct *t)
++{
++	struct evtrack *evtrack;
++
++	evtrack = t->evtrack;
++	if (evtrack == NULL)
++		return;
++
++	spin_lock(&evtrack->lock);
++	evtrack_debug("t=%px, evtrack->t=%px\n", t, evtrack->t);
++	/*
++	 * For EVTRACK_ENABLE devices we want to make sure that t->evtrack->t == t,
++	 * which comes down to:
++	 *        WARN_ON(!evtrack->remote && evtrack->t != t);
++	 *
++	 * 2. The task that created evtrack exiting without calling EVTRACK_DISABLE,
++	 *    and then again we can make sure that t->evtrack->t == t:
++	 *        WARN_ON(evtrack->remote && evtrack->t != t);
++	 *
++	 * By combining all three checks into one we get:
++	 */
++	if (WARN_ON(evtrack->t != t)) {
++		spin_unlock(&evtrack->lock);
++		return;
++	}
++	/* Just to not leave dangling references behind. */
++	evtrack_disable(t, evtrack);
++	spin_unlock(&evtrack->lock);
++	evtrack_put(evtrack);
++	// TODO if nobody called ioctl(disable) before the task exits and nobody closed the file, then the refcount will
++	// stay at 1 right?
++}
++
++static int evtrack_mmap(struct file *filep, struct vm_area_struct *vma)
++{
++	int res = 0;
++	void *area;
++	struct evtrack *evtrack = vma->vm_file->private_data;
++	unsigned long size, off;
++	struct page *page;
++
++	area = vmalloc_user(vma->vm_end - vma->vm_start);
++	if (!area)
++		return -ENOMEM;
++
++	spin_lock(&evtrack->lock);
++	size = evtrack->nr_events * sizeof(struct evtrack_event);
++	if (evtrack->mode != EVTRACK_MODE_INIT || vma->vm_pgoff != 0 ||
++			vma->vm_end - vma->vm_start != size) {
++		res = -EINVAL;
++		goto exit;
++	}
++	if (!evtrack->area) {
++		evtrack->area = area;
++		vma->vm_flags |= VM_DONTEXPAND;
++		spin_unlock(&evtrack->lock);
++		for (off = 0; off < size; off += PAGE_SIZE) {
++			page = vmalloc_to_page(evtrack->area + off);
++			if (vm_insert_page(vma, vma->vm_start + off, page))
++				WARN_ONCE(1, "vm_insert_page() failed");
++		}
++		return 0;
++	}
++exit:
++	spin_unlock(&evtrack->lock);
++	vfree(area);
++	return res;
++}
++
++static int evtrack_open(struct inode *inode, struct file *filep)
++{
++	struct evtrack *evtrack;
++
++	evtrack = kzalloc(sizeof(*evtrack), GFP_KERNEL);
++	if (!evtrack)
++		return -ENOMEM;
++	evtrack->mode = EVTRACK_MODE_DISABLED;
++	/*
++	 * refcount is initially set to 1 to enforce cleaning
++	 * up of the resources after (1) EVTRACK_DISABLE ioctl call
++	 * and (2) close(fd), or task exit. Both (1) and (2) have
++	 * to take place, otherwise there will be a memory leak.
++	 */
++	refcount_set(&evtrack->refcount, 1);
++	spin_lock_init(&evtrack->lock);
++	filep->private_data = evtrack;
++	return nonseekable_open(inode, filep);
++}
++
++static int evtrack_close(struct inode *inode, struct file *filep)
++{
++	evtrack_put(filep->private_data);
++	return 0;
++}
++
++/*
++* Translates user evtrack mode to the internal one.
++*/
++static int evtrack_get_mode(unsigned long arg)
++{
++	if (arg == EVTRACK_TRACK_ALL)
++		return EVTRACK_MODE_TRACK_ALL;
++	else
++		return -EINVAL;
++}
++
++static int evtrack_ioctl_locked(struct evtrack *evtrack, unsigned int cmd,
++                 unsigned long arg)
++{
++	struct task_struct *t = current;
++	unsigned long nr_events, unused;
++	unsigned int size;
++	int mode, prev_mode;
++
++	// DEBUG
++	unsigned int dbg_code, i;
++	unsigned long symbolsize, offset, num_api_methods;
++	struct api* api_info;
++
++
++	switch (cmd) {
++		case EVTRACK_INIT_TRACK:
++			evtrack_debug("EVTRACK_INIT_TRACK (pid=%d, %s)\n", t->pid, t->comm);
++			/*
++			* Enable evtrack in trace mode and setup buffer size.
++			* Must happen before anything else.
++			*/
++			if (evtrack->mode != EVTRACK_MODE_DISABLED)
++				return -EBUSY;
++			/*
++			* Size must be at least 2 to hold current position and one PC.
++			* Later we allocate nr_events * (sizeof(struct evtrack_event)
++			* bytes of memory that must not overflow.
++			*/
++			nr_events = arg;
++			if (nr_events < 2 || nr_events > INT_MAX / sizeof(struct evtrack_event))
++				return -EINVAL;
++			evtrack->nr_events = nr_events;
++			evtrack->mode = EVTRACK_MODE_INIT;
++			return 0;
++
++		case EVTRACK_ENABLE:
++			evtrack_debug("EVTRACK_ENABLE (pid=%d, %s)\n", t->pid, t->comm);
++			/*
++			* Enable event tracking for the current task.
++			* At this point user must have been enabled tracking mode,
++			* and mmapped the file. Event tracking is disabled only
++			* at task exit or voluntary by EVTRACK_DISABLE. After that it can
++			* be enabled for another task.
++			*/
++			if ((evtrack->mode != EVTRACK_MODE_INIT && evtrack->mode != EVTRACK_MODE_STOP) || !evtrack->area)
++				return -EINVAL;
++			if (evtrack->mode == EVTRACK_MODE_INIT && (evtrack->t != NULL || t->evtrack != NULL))
++				return -EBUSY;
++			prev_mode = evtrack->mode;
++			mode = evtrack_get_mode(arg);
++			if (mode < 0)
++				return mode;
++			evtrack->mode = mode;
++			evtrack->timestamp = (__u64) atomic64_read(&timestamp);
++			if (prev_mode == EVTRACK_MODE_STOP) {
++				evtrack_restart(t, evtrack);
++				return 0;
++			}
++			size = evtrack->nr_events * sizeof(struct evtrack_event);
++			evtrack_start(t, size, evtrack->area, evtrack->mode);
++			t->evtrack = evtrack;
++			evtrack->t = t;
++			evtrack->root = RB_ROOT;
++			/* Put either in evtrack_task_exit() or in EVTRACK_DISABLE. */
++			evtrack_get(evtrack);
++			return 0;
++
++		case EVTRACK_STOP:
++			evtrack_debug("EVTRACK_STOP (pid=%d, %s)\n", t->pid, t->comm);
++			/* temporarily stop tracing without deleting any important structures */
++			unused = arg;
++			if (unused != 0 || current->evtrack != evtrack)
++				return -EINVAL;
++			if (WARN_ON(evtrack->t != t))
++				return -EINVAL;
++			evtrack_stop(t, evtrack);
++			return 0;
++
++		case EVTRACK_DISABLE:
++			evtrack_debug("EVTRACK_DISABLE (pid=%d, %s)\n", t->pid, t->comm);
++			/* Disable event tracking for the current task. */
++			unused = arg;
++			if (unused != 0 || current->evtrack != evtrack)
++				return -EINVAL;
++			if (WARN_ON(evtrack->t != t))
++				return -EINVAL;
++			evtrack_disable(t, evtrack);
++			evtrack_put(evtrack);
++			return 0;
++
++		case EVTRACK_DEBUG:
++			dbg_code = arg;
++			switch (dbg_code) {
++				case 1:
++					kallsyms_lookup_size_offset((unsigned long)evtrack_task_init, &symbolsize, &offset);
++					evtrack_debug("EVTRACK_DEBUG %px, %ld, %ld\n", evtrack_task_init, symbolsize, offset);
++					return 0;
++
++				case 2:
++					evtrack_debug("EVTRACK_DEBUG 0x%lx\n", kallsyms_lookup_name("evtrack_task_init"));
++					return 0;
++
++				case 3:
++					api_info = api_details;
++					num_api_methods = sizeof(api_names) / sizeof(api_names[0]);
++					for (i = 0; i < num_api_methods; i++) {
++						evtrack_debug("EVTRACK_DEBUG %s, 0x%lx, 0x%lx\n", api_info->name, api_info->start, api_info->size);
++					}
++					return 0;
++			}
++			return 1;
++
++		default:
++			return -ENOTTY;
++	}
++
++}
++
++static long evtrack_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
++{
++    struct evtrack *evtrack;
++	int res;
++
++	evtrack = filep->private_data;
++	spin_lock(&evtrack->lock);
++	res = evtrack_ioctl_locked(evtrack, cmd, arg);
++	spin_unlock(&evtrack->lock);
++
++	return res;
++}
++
++static const struct file_operations evtrack_fops = {
++    .open		    = evtrack_open,
++    .unlocked_ioctl	= evtrack_ioctl,
++    .compat_ioctl	= evtrack_ioctl,
++    .mmap           = evtrack_mmap,
++    .release        = evtrack_close,
++};
++
++void populate_api_info(void) {
++	struct api* api_info;
++	char *api_name;
++	unsigned long i, addr, symbolsize, offset, num_api_methods;
++
++	api_details = (struct api*)kmalloc(sizeof(struct api) * sizeof(api_names), GFP_KERNEL);
++	api_info = api_details;
++	num_api_methods = sizeof(api_names) / sizeof(api_names[0]);
++	for (i = 0; i < num_api_methods; i++) {
++		api_name = api_names[i];
++		addr = kallsyms_lookup_name(api_name);
++		if (addr) {
++			kallsyms_lookup_size_offset(addr, &symbolsize, &offset);
++			strncpy(api_info->name, api_name, 256);
++			api_info->start = addr;
++			api_info->size = symbolsize;
++			api_info++;
++		}
++	}
++}
++
++static int __init evtrack_init(void)
++{
++	struct dentry* evtrack_dir;
++
++    /*
++	 * The EVTRACK debugfs file won't ever get removed and thus,
++	 * there is no need to protect it against removal races. The
++	 * use of debugfs_create_file_unsafe() is actually safe here.
++	 */
++    debugfs_create_file_unsafe("evtrack", 0600, NULL, NULL, &evtrack_fops);
++	// Ref: https://www.kernel.org/doc/html/latest/filesystems/debugfs.html
++	evtrack_dir = debugfs_create_dir("ev", NULL);
++	debugfs_create_bool("noconsole", 0600, evtrack_dir, &noconsole);
++	debugfs_create_bool("noshmem", 0600, evtrack_dir, &noshmem);
++	debugfs_create_ulong("evcnt", 0600, evtrack_dir, &evcnt);
++	debugfs_create_ulong("max_evcnt", 0600, evtrack_dir, &max_evcnt);
++	debugfs_create_x64("evtypes", 0600, evtrack_dir, &evtypes);
++
++	populate_api_info();
++    return 0;
++}
++
++device_initcall(evtrack_init);
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 15dc2ec80c46..627d8a1855c1 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -60,6 +60,7 @@
+ #include <linux/writeback.h>
+ #include <linux/shm.h>
+ #include <linux/kcov.h>
++#include <linux/evtrack.h>
+ #include <linux/kmsan.h>
+ #include <linux/random.h>
+ #include <linux/rcuwait.h>
+@@ -812,6 +813,7 @@ void __noreturn do_exit(long code)
+ 	WARN_ON(tsk->plug);
+ 
+ 	kcov_task_exit(tsk);
++	evtrack_task_exit(tsk);
+ 	kmsan_task_exit(tsk);
+ 
+ 	coredump_task_exit(tsk);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9f7fe3541897..00960f257d33 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -109,6 +109,10 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/task.h>
+ 
++#ifdef CONFIG_EVTRACK
++#include <linux/evtrack.h>
++#endif
++
+ /*
+  * Minimum number of threads to boot the kernel
+  */
+@@ -997,6 +1001,10 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ 	if (err)
+ 		goto free_stack;
+ 
++#ifdef CONFIG_EVTRACK
++	evtrack_task_init(tsk);
++#endif
++
+ #ifdef CONFIG_SECCOMP
+ 	/*
+ 	 * We must handle setting up seccomp filters once we're under
+diff --git a/kernel/my_syscall.c b/kernel/my_syscall.c
+new file mode 100644
+index 000000000000..273996a1ebde
+--- /dev/null
++++ b/kernel/my_syscall.c
+@@ -0,0 +1,55 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++
++/*
++* Using the the following pragmas to prevent gcc optimize
++* out `ptr` had the unintended side effect of printk()
++* not printing raw kernel addresses any more. If the
++* pramgas are used, dmesg contains the following:
++* sys_mycall: ptr = 0000000000000010
++* Ref: https://github.com/torvalds/linux/blob/master/Documentation/core-api/printk-formats.rst
++* According to the doc above, "%px" is supposed to
++* print unmodified kernel address, albeit unsafe.
++* To workaround the gcc optimization issue, we
++* mark the pointer as `volatile`
++*/
++
++// #pragma GCC push_options
++// #pragma GCC optimize("O0")
++
++#define NR_MAX_TRACE_ENTRIES 32
++
++SYSCALL_DEFINE0(mycall)
++{
++    volatile char* heap_ptr;
++    volatile unsigned long* heap_write_ptr;
++    volatile unsigned long stack_var;
++    /*
++    unsigned int nr_trace, i;
++    unsigned long trace[NR_MAX_TRACE_ENTRIES];
++    */
++
++    /* printk("sys_mycall: stack-trace\n");
++    // Print stack-trace
++    nr_trace = stack_trace_save(trace, NR_MAX_TRACE_ENTRIES, 0);
++    nr_trace = (nr_trace <= NR_MAX_TRACE_ENTRIES) ? nr_trace : NR_MAX_TRACE_ENTRIES;
++    for(i = 0; i < nr_trace; i++)
++        printk("|----> (%d) %lx\n", i, trace[i]); */
++
++    heap_ptr = (char*)kmalloc(2048, GFP_KERNEL);
++    // printk("sys_mycall: kmalloc=%px\n", heap_ptr);
++
++    // Test if __asan_loadN/__asan_storeN instruments both stack and heap load/store
++    stack_var = 0xcafebabe;
++    heap_write_ptr = (unsigned long*)(heap_ptr + 0x10);
++    *heap_write_ptr = 0xdeadbeef;
++    printk("sys_mycall: stack_write=%px, heap_write=%px\n", &stack_var, heap_write_ptr);
++
++    // Casting was necessary to suppress kfree() warning about volatile pointer
++    kfree((void*)heap_ptr);
++    // printk("sys_mycall: kfree=%px\n", heap_ptr);
++
++    return 0;
++}
++
++// #pragma GCC pop_options
+diff --git a/kernel/my_syscall2.c b/kernel/my_syscall2.c
+new file mode 100644
+index 000000000000..6499bc5b3959
+--- /dev/null
++++ b/kernel/my_syscall2.c
+@@ -0,0 +1,42 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mycall.h>
++
++/*
++ * Using the the following pragmas to prevent gcc optimize
++ * out `ptr` had the unintended side effect of printk()
++ * not printing raw kernel addresses any more. If the
++ * pramgas are used, dmesg contains the following:
++ * sys_mycall: ptr = 0000000000000010
++ * Ref: https://github.com/torvalds/linux/blob/master/Documentation/core-api/printk-formats.rst
++ * According to the doc above, "%px" is supposed to
++ * print unmodified kernel address, albeit unsafe.
++ * To workaround the gcc optimization issue, we
++ * mark the pointer as `volatile`
++ */
++
++// #pragma GCC push_options
++// #pragma GCC optimize("O0")
++
++#define NR_MAX_TRACE_ENTRIES 32
++
++static char *heap_ptr;
++
++SYSCALL_DEFINE0(mycall2)
++{
++	volatile unsigned long* heap_write_ptr;
++
++	heap_ptr = (char*)kmalloc(32, GFP_KERNEL);
++
++	heap_write_ptr = (unsigned long*)(heap_ptr + 0x10);
++	*heap_write_ptr = 0xdeadbeef;
++	printk("sys_mycall2: wrote value %lx\n", *heap_write_ptr);
++
++	return 0;
++}
++
++char *get_my_pointer(void) {
++	return heap_ptr;
++}
++
++// #pragma GCC pop_options
+diff --git a/kernel/my_syscall3.c b/kernel/my_syscall3.c
+new file mode 100644
+index 000000000000..6b1bdb780ac5
+--- /dev/null
++++ b/kernel/my_syscall3.c
+@@ -0,0 +1,39 @@
++#include <linux/kernel.h>
++#include <linux/syscalls.h>
++#include <linux/mycall.h>
++
++/*
++ * Using the the following pragmas to prevent gcc optimize
++ * out `ptr` had the unintended side effect of printk()
++ * not printing raw kernel addresses any more. If the
++ * pramgas are used, dmesg contains the following:
++ * sys_mycall: ptr = 0000000000000010
++ * Ref: https://github.com/torvalds/linux/blob/master/Documentation/core-api/printk-formats.rst
++ * According to the doc above, "%px" is supposed to
++ * print unmodified kernel address, albeit unsafe.
++ * To workaround the gcc optimization issue, we
++ * mark the pointer as `volatile`
++ */
++
++// #pragma GCC push_options
++// #pragma GCC optimize("O0")
++
++#define NR_MAX_TRACE_ENTRIES 32
++
++SYSCALL_DEFINE0(mycall3)
++{
++
++	volatile unsigned long* heap_write_ptr;
++	volatile unsigned long my_val;
++	volatile char *heap_ptr = get_my_pointer();
++	printk("sys_mycall3: get_my_pointer(): %px\n", heap_ptr);
++	heap_write_ptr = (unsigned long*)(heap_ptr + 0x10);
++	my_val = *heap_write_ptr;
++	printk("sys_mycall3: read value %lx\n", my_val);
++	*heap_write_ptr = 0xcafebabe;
++	printk("sys_mycall3: new value %lx\n", *heap_write_ptr);
++
++	kfree((void*)heap_ptr);
++	return 0;
++}
++// #pragma GCC pop_options
+diff --git a/lib/Kconfig.kasan b/lib/Kconfig.kasan
+index be6ee6020290..890e9d5edee2 100644
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@ -25,6 +25,15 @@ config CC_HAS_KASAN_GENERIC
+ config CC_HAS_KASAN_SW_TAGS
+ 	def_bool $(cc-option, -fsanitize=kernel-hwaddress)
+ 
++config EVTRACK
++	bool "EVTRACK: User-space tracking of kernel events"
++	depends on KASAN
++	help
++	  Track kernel-space events, e.g. memory allocation,
++	  deallocation, read/write of stack/heap/static variables,
++	  copying of data to user-space etc.
++
++
+ # This option is only required for software KASAN modes.
+ # Old GCC versions do not have proper support for no_sanitize_address.
+ # See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=89124 for details.
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index 833bf2cfd2a3..e393557733a1 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -26,6 +26,7 @@
+ #include <linux/string.h>
+ #include <linux/types.h>
+ #include <linux/bug.h>
++#include <linux/evtrack.h>
+ 
+ #include "kasan.h"
+ #include "../slab.h"
+@@ -205,6 +206,10 @@ static inline bool ____kasan_slab_free(struct kmem_cache *cache, void *object,
+ 	if (!kasan_arch_is_ready())
+ 		return false;
+ 
++#ifdef CONFIG_EVTRACK
++	record_event(EVTRACK_EVENT_HEAP_DEALLOCATION, object, 0, 0);
++#endif
++
+ 	tagged_object = object;
+ 	object = kasan_reset_tag(object);
+ 
+@@ -333,6 +338,12 @@ static inline void *____kasan_kmalloc(struct kmem_cache *cache,
+ 	unsigned long redzone_start;
+ 	unsigned long redzone_end;
+ 
++#ifdef CONFIG_EVTRACK
++	//keep_tag is not used
++	record_event(EVTRACK_EVENT_HEAP_ALLOCATION, object, size, 0);
++#endif
++
++
+ 	if (gfpflags_allow_blocking(flags))
+ 		kasan_quarantine_reduce();
+ 
+diff --git a/mm/kasan/generic.c b/mm/kasan/generic.c
+index b076f597a378..3ac2547ce9fc 100644
+--- a/mm/kasan/generic.c
++++ b/mm/kasan/generic.c
+@@ -30,6 +30,7 @@
+ #include <linux/types.h>
+ #include <linux/vmalloc.h>
+ #include <linux/bug.h>
++#include <linux/evtrack.h>
+ 
+ #include "kasan.h"
+ #include "../slab.h"
+@@ -177,6 +178,13 @@ static __always_inline bool check_region_inline(unsigned long addr,
+ 		return !kasan_report(addr, size, write, ret_ip);
+ 	}
+ 
++#ifdef CONFIG_EVTRACK
++	if (write)
++		record_event(EVTRACK_EVENT_HEAP_WRITE, (void*)addr, size, write);
++	else
++		record_event(EVTRACK_EVENT_HEAP_READ, (void*)addr, size, write);
++#endif
++
+ 	if (likely(!memory_is_poisoned(addr, size)))
+ 		return true;
+ 
