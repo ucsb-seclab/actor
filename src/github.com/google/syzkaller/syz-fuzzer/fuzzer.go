@@ -802,12 +802,9 @@ func (fuzzer *Fuzzer) updateEvDropRate() {
 	}
 }
 
-func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
+func (fuzzer *Fuzzer) getCurBatch() *prog.Batch {
 	fuzzer.eventsMu.Lock()
 	defer fuzzer.eventsMu.Unlock()
-	if rand.Intn(100) < fuzzer.evDropRate {
-		return
-	}
 	var curBatch prog.Batch
 	if len(fuzzer.batches) > 0 {
 		ind := len(fuzzer.batches) - 1
@@ -816,6 +813,19 @@ func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
 	} else {
 		fuzzer.batches = append(fuzzer.batches, curBatch)
 	}
+	return &curBatch
+}
+
+func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
+	// we could also accept the race here versus the update to reduce locking effort
+	fuzzer.eventsMu.Lock()
+	if rand.Intn(100) < fuzzer.evDropRate {
+		return
+	}
+	fuzzer.eventsMu.Unlock()
+	
+	var curBatch *prog.Batch = fuzzer.getCurBatch()
+	
 	var flattened []prog.EvtrackEvent
 	for i, call := range info.Calls {
 		// To completely ignore events from the 14 banned syscalls, check for the name and continue here
@@ -832,13 +842,16 @@ func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
 	}
 	curBatch.Events = append(curBatch.Events, flattened)
 	curBatch.Size += uint64(len(flattened))
+
+	fuzzer.eventsMu.Lock()
+	defer fuzzer.eventsMu.Unlock()
 	fuzzer.numEvents += uint64(len(flattened))
-	fuzzer.batches[len(fuzzer.batches)-1] = curBatch
+	fuzzer.batches[len(fuzzer.batches)-1] = *curBatch
 	if curBatch.Size >= 2000 {
-		curBatch = *new(prog.Batch)
+		curBatch = new(prog.Batch)
 		curBatch.Size = 0
 		curBatch.Events = make([][]prog.EvtrackEvent, 0)
-		fuzzer.batches = append(fuzzer.batches, curBatch)
+		fuzzer.batches = append(fuzzer.batches, *curBatch)
 		select {
 		case fuzzer.hasBatch <- true:
 		default:
