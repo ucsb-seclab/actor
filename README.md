@@ -100,8 +100,6 @@ cd ..
 2. Build ACTOR.
 ```
 cd src/github.com/google/syzkaller/
-go mod tidy
-go mod vendor
 export GO111MODULE=off
 make -j$(nproc)
 cd ../../../../
