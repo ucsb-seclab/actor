@@ -22,6 +22,7 @@ cd actor
 
 You will need to build a Linux kernel, syzkaller.
 Make sure you have all build dependencies for these tools installed (check their official websites).
+Additionally, the static analysis requires docker.
 
 
 ### Static Analysis
@@ -41,36 +42,29 @@ git apply ../setup/kernel/v6-2-rc5.patch
 cd ..
 ```
 
-4. Install clang 14 or newer. You can either build LLVM from source or download prebuilt libraries. Please refer to LLVM's documentation for detailed steps. Make sure to add clang to your PATH.
-
-5. Next, compile the static analysis pass:
+4. Build the docker container that includes the static analysis pass:
 ```
 cd semantic-inference
-mkdir build
-cd build
-cmake ..
-make
-cd ../..
+docker build -t sem-infer .
+cd ..
 ```
 
-6. `semantic-inference/my-clang` is a wrapper script for invoking the LLVM pass. Change the path of clang in this script to wherever clang and the LLVM pass are located on your system (e.g., find that location with `which clang` if clang is in your PATH).
+Now we are ready to perform the static analysis!
 
-Now we are ready to perform the static analysis! 
-```
-cd linux
-```
+5. But first, you need a kernel config. We suggest to either use defconfig or syzbot's, but any config that works for you is fine. You can generate defconfig by `make defconfig`.
 
-7. But first, you need a kernel config. We suggest to either use defconfig or syzbots, but any config that works for you is fine. You can generate defconfig by `make defconfig`.
-
-8. Apply changes required by ACTOR to the chosen kernel config:
+6. Run the static analysis. To start the docker:
 ```
-./scripts/kconfig/merge_config.sh .config ../setup/kernel/actor_static.config
+docker run -ti -v "/path/to/linux":/kernel --entrypoint /bin/bash sem-infer
 ```
-
-9. Build the kernel/perform the static analysis. If you don't want to use all cores, replace `$(nproc)` with the number of cores you want to use. The `ptrs.txt` file will later be used by ACTOR for the semantic refinement.
+Inside the docker, run:
 ```
-make CC=../semantic-inference/my-clang -j$(nproc) 2>ptrs.txt
+cd /kernel
+make olddefconfig CC=clang-ktypes
+CC=clang-ktypes ./scripts/kconfig/merge_config.sh .config /plugin/actor_static.config
+make -C /kernel/ -j `nproc` CC=clang-ktypes 2> /kernel/ptrs.txt
 ```
+After the compilation finished, you can exit the docker container.
 
 
 ### Kernel preparation
