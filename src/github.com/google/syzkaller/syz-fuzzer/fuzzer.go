@@ -820,6 +820,7 @@ func (fuzzer *Fuzzer) checkNewEvents(p *prog.Prog, info *ipc.ProgInfo) {
 	// we could also accept the race here versus the update to reduce locking effort
 	fuzzer.eventsMu.Lock()
 	if rand.Intn(100) < fuzzer.evDropRate {
+		fuzzer.eventsMu.Unlock()
 		return
 	}
 	fuzzer.eventsMu.Unlock()
